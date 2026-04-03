@@ -280,15 +280,10 @@ def _get_current_price(context, code):
         except Exception:
             return None
     else:
-        # 回测模式：必须用1分钟线获取当前价格，拿不到就跳过，绝不回退日线
-        try:
-            raw = get_history(1, '1m', 'close', code, fq='pre', include=True, is_dict=True)
-            if raw:
-                cl = _extract_close_list(raw, code)
-                if cl and len(cl) > 0:
-                    return float(cl[-1])
-        except Exception:
-            pass
+        # 回测模式：用1分钟线获取当前价格，拿不到就跳过，绝不回退日线
+        result = _get_minute_close_and_high(code)
+        if result:
+            return result[0]  # close
         return None
 
 
@@ -330,38 +325,40 @@ def _extract_close_list(raw_dict, code):
     return res if res else None
 
 
-def _get_minute_high(code):
-    """回测模式：获取当前1分钟K线的最高价，用于精确追踪持仓最高价"""
+def _get_minute_close_and_high(code):
+    """回测模式：一次API调用获取当前1分钟K线的收盘价和最高价
+    返回 (close, high) 或 None
+    is_dict=True 时返回完整8列: (time, open, high, low, close, vol, money, price)
+    """
     try:
-        raw = get_history(1, '1m', 'high', code, fq='pre', include=True, is_dict=True)
-        if raw:
-            arr = None
-            if code in raw:
-                arr = raw[code]
-            else:
-                for old, new in [('.SS', '.XSHG'), ('.SZ', '.XSHE'),
-                                 ('.XSHG', '.SS'), ('.XSHE', '.SZ')]:
-                    alt = code.replace(old, new)
-                    if alt in raw:
-                        arr = raw[alt]
+        raw = get_history(1, '1m', 'close', code, fq='pre', include=True, is_dict=True)
+        if not raw:
+            return None
+        arr = None
+        if code in raw:
+            arr = raw[code]
+        else:
+            for old, new in [('.SS', '.XSHG'), ('.SZ', '.XSHE'),
+                             ('.XSHG', '.SS'), ('.XSHE', '.SZ')]:
+                alt = code.replace(old, new)
+                if alt in raw:
+                    arr = raw[alt]
+                    break
+            if arr is None:
+                code6 = code[:6]
+                for k in raw:
+                    if k[:6] == code6:
+                        arr = raw[k]
                         break
-                if arr is None:
-                    code6 = code[:6]
-                    for k in raw:
-                        if k[:6] == code6:
-                            arr = raw[k]
-                            break
-            if arr is not None and len(arr) > 0:
-                row = arr[-1]
-                if isinstance(row, (int, float)):
-                    return float(row)
-                elif hasattr(row, '__len__'):
-                    # field='high' 单字段时，结构可能是标量或元组
-                    # 完整行: (time, open, high, low, close, vol, money, price)
-                    if len(row) >= 3:
-                        return float(row[2])  # high 字段
-                    elif len(row) > 0:
-                        return float(row[-1])
+        if arr is None or len(arr) == 0:
+            return None
+        row = arr[-1]
+        if isinstance(row, (int, float)):
+            return (float(row), float(row))
+        elif hasattr(row, '__len__') and len(row) >= 5:
+            close_val = float(row[4])
+            high_val = float(row[2])
+            return (close_val, high_val)
     except Exception:
         pass
     return None
@@ -456,7 +453,6 @@ def calc_realtime_ranking(context):
 
     for code in g.tradable_codes:
         try:
-            # 回测用is_dict=False（返回DataFrame），实盘也兼容
             raw = get_history(need_bars, '1d', 'close', code, fq='pre', include=False, is_dict=True)
             if raw is None:
                 continue
@@ -659,15 +655,21 @@ def _minute_risk_scan(context):
         return
 
     # 获取实时价格
-    current_price = _get_current_price(context, code)
-    if current_price is None or current_price <= 0:
-        return
-
-    # 更新最高价（回测模式还要用分钟K线最高价，避免遗漏盘中尖峰）
-    _update_highest_price(code, current_price)
-    if not is_trade():
-        minute_high = _get_minute_high(code)
-        if minute_high and minute_high > 0:
+    if is_trade():
+        current_price = _get_current_price(context, code)
+        if current_price is None or current_price <= 0:
+            return
+        _update_highest_price(code, current_price)
+    else:
+        # 回测模式：一次调用同时拿 close 和 high，避免重复调API
+        result = _get_minute_close_and_high(code)
+        if not result:
+            return
+        current_price, minute_high = result
+        if current_price <= 0:
+            return
+        _update_highest_price(code, current_price)
+        if minute_high > 0:
             _update_highest_price(code, minute_high)
 
     # 计算跌幅
