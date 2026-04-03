@@ -1,20 +1,9 @@
 # ═══════════════════════════════════════════════════════════════
 # ETF T+0 日内做T策略 V3 - PTrade
 # ─────────────────────────────────────────────────────────────
-# 核心逻辑：
-#   - 标的池分主力/备选，优先交易高波动ETF
-#   - 买入条件：VWAP下1% + 缩量确认 + 企稳 + 大盘不崩
-#   - 卖出条件：分三档止盈 + 上涨缩量主动减仓
-#   - 止损：买入价 -1% 全部卖出（快止损）
-#   - 14:55 强制清仓，绝不留隔夜仓
-#
-# V3新增（参考深化需求文档）：
-#   - 沪深300大盘情绪过滤：大盘放量暴跌时暂停买入
-#   - 当日成交额 vs 近5日均值：量比维度更准确
-#   - 流动性过滤：成交额过低的标的跳过
-#   - 卖出放量确认：放量上涨时延迟止盈，缩量上涨加速止盈
-#
-# 盈亏比：赚1%~2% vs 亏1%，胜率>43%即可盈利
+# 核心逻辑：VWAP下1%买 → +1%/+1.5%/+2%分档卖 → -1%止损
+# 辅助过滤：量比 + 换手率 + 内外盘 + 委比 + 大盘情绪
+# 14:55强制清仓，绝不留隔夜仓
 # ═══════════════════════════════════════════════════════════════
 
 import json
@@ -79,6 +68,97 @@ def _save_json(filename, data):
         os.rename(tmp_path, path)
     except Exception as e:
         log.error('[硬盘写入失败] %s: %s' % (filename, str(e)))
+
+
+# ─────────────────────────────────────────────────────────────
+# PTrade兼容层（回测/实盘通用）
+# ─────────────────────────────────────────────────────────────
+
+def _get_snap(code):
+    """获取快照（兼容回测和实盘）
+    回测模式get_snapshot不可用，fallback到get_history
+    返回: dict 或 None
+    """
+    if is_trade():
+        try:
+            snap = get_snapshot(code)
+            if not snap:
+                return None
+            info = snap.get(code, None)
+            if info is None:
+                for k in snap:
+                    if k[:6] == code[:6]:
+                        info = snap[k]
+                        break
+            return info
+        except Exception:
+            return None
+    else:
+        # 回测模式：用get_history模拟基本字段
+        try:
+            raw = get_history(2, '1d', 'close', code, fq='pre', include=True)
+            if raw is None or len(raw) == 0:
+                return None
+            closes = list(raw[code]) if code in raw else []
+            if not closes:
+                return None
+            px = float(closes[-1])
+            preclose = float(closes[-2]) if len(closes) > 1 else px
+            return {
+                'last_px': px,
+                'open_px': px,  # 回测近似
+                'high_px': px,
+                'low_px': px,
+                'preclose_px': preclose,
+                'wavg_px': px,   # 回测无法获取真实VWAP，用收盘价近似
+                'business_amount': 0,
+                'business_balance': 0,
+                'vol_ratio': 1.0,
+                'turnover_ratio': 0,
+                'business_amount_in': 0,
+                'business_amount_out': 0,
+                'entrust_rate': 0,
+                'entrust_diff': 0,
+            }
+        except Exception:
+            return None
+
+
+def _get_buy_price(code):
+    """获取买入报价（ETF 3位小数，上浮0.2%确保成交）"""
+    snap = _get_snap(code)
+    if not snap:
+        return None
+    px = float(snap.get('last_px', 0))
+    if px <= 0:
+        return None
+    return round(px * 1.002, 3)
+
+
+def _get_sell_price(code):
+    """获取卖出报价（ETF 3位小数，下浮0.2%确保成交）"""
+    snap = _get_snap(code)
+    if not snap:
+        return None
+    px = float(snap.get('last_px', 0))
+    if px <= 0:
+        return None
+    return round(px * 0.998, 3)
+
+
+def _get_closeable_amount(code):
+    """获取可卖数量（T+0 ETF当日买入当日可卖）"""
+    try:
+        pos = get_position(code)
+        if pos is None:
+            return 0
+        # enable_amount / closeable_amount 都可能出现
+        amt = getattr(pos, 'enable_amount', None)
+        if amt is None:
+            amt = getattr(pos, 'closeable_amount', 0)
+        return int(float(amt))
+    except Exception:
+        return 0
 
 
 def _create_default_config():
@@ -149,6 +229,15 @@ def _load_config():
 # ─────────────────────────────────────────────────────────────
 
 def initialize(context):
+    # PTrade系统参数
+    set_parameters(server_restart_not_do_before="1", receive_cancel_response="1")
+
+    # 回测设置（实盘自动跳过）
+    if not is_trade():
+        set_commission(commission_ratio=0.0003)
+        set_slippage(slippage=0.001)
+        set_benchmark('513100.SS')
+
     config = _load_config()
 
     # ── 资金配置（用户在配置文件里改）──
@@ -212,11 +301,12 @@ def initialize(context):
     g.last_log_time = {}
     g.market_paused = False
     g.etf_avg_amounts = {}
+    g.pending_order = {'code': None, 'side': None}  # 防重复下单
 
-    # ── 定时任务 ──
+    # ── 定时任务（回测14:59，实盘15:05）──
     run_daily(context, _reset_daily_state, time='09:25')
     run_daily(context, _force_clear_all, time=g.clear_time)
-    run_daily(context, _print_daily_summary, time='15:05')
+    run_daily(context, _print_daily_summary, time='14:59' if not is_trade() else '15:05')
 
     log.info('═══════════════════════════════════════════════')
     log.info('  ETF T+0 做T策略 V3')
@@ -229,6 +319,25 @@ def initialize(context):
         g.max_trades_per_day, g.max_concurrent_etf,
         g.start_trade_time, g.clear_time))
     log.info('═══════════════════════════════════════════════')
+
+
+# ─────────────────────────────────────────────────────────────
+# 盘前准备（参考etf23策略）
+# ─────────────────────────────────────────────────────────────
+
+def before_trading_start(context, data):
+    """盘前：同步真实持仓，清理过期状态"""
+    g.pending_order = {'code': None, 'side': None}
+
+    # 同步真实持仓到 g.today_positions
+    # 正常情况T+0策略不应有隔夜仓，但防万一
+    for code in g.etf_pool:
+        pos = get_position(code)
+        if pos and pos.amount > 0:
+            log.warning('[盘前] 发现隔夜仓 %s(%s) %d股，将在开盘后清仓' % (
+                _etf_name(code), code, pos.amount))
+
+    log.info('[盘前] 准备就绪 | 可交易标的: %d只' % len(g.etf_pool))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -248,6 +357,7 @@ def _reset_daily_state(context):
     g.today_etf_trades = {}
     g.today_used_capital = 0
     g.market_paused = False
+    g.pending_order = {'code': None, 'side': None}
     log.info('[日内重置] 状态已清空 | 今日可用资金: %.0f元' % g.allocated_capital)
 
     # ── 趋势过滤 ──
@@ -318,21 +428,12 @@ def _check_market_sentiment(now):
     返回: True=可以交易, False=暂停买入
     """
     try:
-        snapshot = get_snapshot(g.market_benchmark)
-        if not snapshot:
-            return True  # 拿不到数据不阻止
-
-        snap = snapshot.get(g.market_benchmark, None)
-        if snap is None:
-            # 尝试不带后缀
-            for k in snapshot:
-                snap = snapshot[k]
-                break
+        snap = _get_snap(g.market_benchmark)
         if snap is None:
             return True
 
-        px = snap.get('last_px', 0)
-        open_px = snap.get('open_px', 0)
+        px = float(snap.get('last_px', 0))
+        open_px = float(snap.get('open_px', 0))
         if px <= 0 or open_px <= 0:
             return True
 
@@ -403,20 +504,14 @@ def handle_data(context, data):
 
     # ── 记录大盘成交量（用于大盘缩放量判断）──
     try:
-        mkt_snap = get_snapshot(g.market_benchmark)
-        if mkt_snap:
-            ms = mkt_snap.get(g.market_benchmark, None)
-            if ms is None:
-                for k in mkt_snap:
-                    ms = mkt_snap[k]
-                    break
-            if ms:
-                cum_vol = ms.get('business_amount', 0)
-                if g.market_benchmark not in g.volume_history:
-                    g.volume_history[g.market_benchmark] = []
-                g.volume_history[g.market_benchmark].append((cum_vol, ms.get('last_px', 0)))
-                if len(g.volume_history[g.market_benchmark]) > 310:
-                    g.volume_history[g.market_benchmark] = g.volume_history[g.market_benchmark][-310:]
+        ms = _get_snap(g.market_benchmark)
+        if ms:
+            cum_vol = ms.get('business_amount', 0)
+            if g.market_benchmark not in g.volume_history:
+                g.volume_history[g.market_benchmark] = []
+            g.volume_history[g.market_benchmark].append((cum_vol, ms.get('last_px', 0)))
+            if len(g.volume_history[g.market_benchmark]) > 310:
+                g.volume_history[g.market_benchmark] = g.volume_history[g.market_benchmark][-310:]
     except Exception:
         pass
 
@@ -447,21 +542,15 @@ def handle_data(context, data):
 
 def _process_single_etf(context, code, now):
     """单个ETF的做T逻辑"""
-    snapshot = get_snapshot(code)
-    if snapshot is None or len(snapshot) == 0:
-        return
-
-    snap = snapshot.get(code, None)
-    if snap is None:
-        snap = snapshot.get(code.split('.')[0], None)
+    snap = _get_snap(code)
     if snap is None:
         return
 
-    current_price = snap.get('last_px', 0)
-    vwap = snap.get('wavg_px', 0)
-    high_px = snap.get('high_px', 0)
-    low_px = snap.get('low_px', 0)
-    open_px = snap.get('open_px', 0)
+    current_price = float(snap.get('last_px', 0))
+    vwap = float(snap.get('wavg_px', 0))
+    high_px = float(snap.get('high_px', 0))
+    low_px = float(snap.get('low_px', 0))
+    open_px = float(snap.get('open_px', 0))
 
     if current_price <= 0 or vwap <= 0:
         return
@@ -656,18 +745,15 @@ def _print_monitor_panel(context, now):
         if code in g.trend_blocked:
             continue
         try:
-            snapshot = get_snapshot(code)
-            if not snapshot:
-                continue
-            snap = snapshot.get(code, snapshot.get(code.split('.')[0], None))
+            snap = _get_snap(code)
             if not snap:
                 continue
 
-            px = snap.get('last_px', 0)
-            vwap = snap.get('wavg_px', 0)
-            open_px = snap.get('open_px', 0)
-            high_px = snap.get('high_px', 0)
-            low_px = snap.get('low_px', 0)
+            px = float(snap.get('last_px', 0))
+            vwap = float(snap.get('wavg_px', 0))
+            open_px = float(snap.get('open_px', 0))
+            high_px = float(snap.get('high_px', 0))
+            low_px = float(snap.get('low_px', 0))
             if px <= 0 or vwap <= 0:
                 continue
 
@@ -815,43 +901,87 @@ def _check_volume_shrink(code):
 # ─────────────────────────────────────────────────────────────
 
 def _do_buy(context, code, price, vwap, now, vol_status='neutral'):
-    # 用配置的固定金额买入，不依赖账户总资产
+    # 防重复下单
+    pending = g.pending_order
+    if pending.get('side') == 'buy' and pending.get('code') and pending['code'][:6] == code[:6]:
+        log.info('[买入] %s 已有未完成买单，等待' % _etf_name(code))
+        return
+
+    # 用配置的固定金额买入
     buy_value = min(g.buy_amount_per_trade, g.allocated_capital - g.today_used_capital)
     if buy_value < 1000:
         return
-    buy_amount = _round_lot(int(buy_value / price))
+
+    # 获取买入报价（上浮0.2%确保成交，ETF 3位小数）
+    buy_price = _get_buy_price(code)
+    if not buy_price or buy_price <= 0:
+        log.warning('[买入] %s 无法获取价格' % _etf_name(code))
+        return
+
+    buy_amount = _round_lot(int(buy_value / buy_price))
     if buy_amount < 100:
         return
 
-    commission = max(buy_amount * price * g.commission_rate, g.min_commission)
-    order_id = order(code, buy_amount, limit_price=price)
+    # 资金检查
+    cash = context.portfolio.cash
+    if buy_amount * buy_price > cash * 0.98:
+        buy_amount = _round_lot(int(cash * 0.98 / buy_price))
+        if buy_amount < 100:
+            return
+
+    order_id = order(code, buy_amount, limit_price=buy_price)
     if order_id:
-        actual_cost = buy_amount * price
-        g.today_buy_prices[code] = price
+        actual_cost = buy_amount * buy_price
+        g.today_buy_prices[code] = price  # 记录触发时的真实价格（非报价）
         g.today_positions[code] = buy_amount
         g.today_trades += 1
         g.today_etf_trades[code] = g.today_etf_trades.get(code, 0) + 1
         g.today_used_capital += actual_cost
         g.last_buy_time[code] = now
         g.today_sold_stage[code] = set()
-        log.info('[买入] %s(%s) | 价:%.3f | VWAP:%.3f(偏离%+.2f%%) | 量:%d | 金额:%.0f | 费:%.1f | %s' % (
-            _etf_name(code), code, price, vwap,
-            (price / vwap - 1) * 100, buy_amount, actual_cost, commission, vol_status))
-        log.info('[资金] 已用:%.0f / 分配:%.0f | 今日交易:%d/%d' % (
-            g.today_used_capital, g.allocated_capital, g.today_trades, g.max_trades_per_day))
+        g.pending_order = {'code': code, 'side': 'buy'}
+        log.info('[买入委托] %s(%s) | 报价:%.3f | VWAP:%.3f(偏离%+.2f%%) | 量:%d | 金额:%.0f | %s' % (
+            _etf_name(code), code, buy_price, vwap,
+            (price / vwap - 1) * 100, buy_amount, actual_cost, vol_status))
+    else:
+        log.error('[买入] %s 委托失败' % _etf_name(code))
 
 
 def _do_sell(context, code, amount, price, reason):
     if amount < 100:
         return
-    order_id = order(code, -amount, limit_price=price)
+
+    # 防重复下单
+    pending = g.pending_order
+    if pending.get('side') == 'sell' and pending.get('code') and pending['code'][:6] == code[:6]:
+        log.info('[卖出] %s 已有未完成卖单，等待' % _etf_name(code))
+        return
+
+    # 检查实际可卖数量
+    closeable = _get_closeable_amount(code)
+    if closeable <= 0:
+        # 回测模式可能无法获取，用记录值
+        closeable = amount
+    sell_amount = min(amount, closeable)
+    sell_amount = _round_lot(sell_amount)
+    if sell_amount < 100:
+        return
+
+    # 获取卖出报价（下浮0.2%确保成交）
+    sell_price = _get_sell_price(code)
+    if not sell_price or sell_price <= 0:
+        sell_price = round(price * 0.998, 3)
+
+    order_id = order(code, -sell_amount, limit_price=sell_price)
     if order_id:
-        g.today_positions[code] = max(g.today_positions.get(code, 0) - amount, 0)
-        # 卖出回收资金
-        sell_value = amount * price
+        g.today_positions[code] = max(g.today_positions.get(code, 0) - sell_amount, 0)
+        sell_value = sell_amount * sell_price
         g.today_used_capital = max(g.today_used_capital - sell_value, 0)
-        log.info('[卖出] %s(%s) | 价:%.3f | 量:%d | 回收:%.0f | %s' % (
-            _etf_name(code), code, price, amount, sell_value, reason))
+        g.pending_order = {'code': code, 'side': 'sell'}
+        log.info('[卖出委托] %s(%s) | 报价:%.3f | 量:%d | 回收:%.0f | %s' % (
+            _etf_name(code), code, sell_price, sell_amount, sell_value, reason))
+    else:
+        log.error('[卖出] %s 委托失败' % _etf_name(code))
 
 
 def _sell_all_today(context, code, price, reason):
@@ -865,27 +995,33 @@ def _sell_all_today(context, code, price, reason):
 # ─────────────────────────────────────────────────────────────
 
 def _force_clear_all(context):
+    """14:55强制清仓"""
     cleared = False
     for code in list(g.today_positions.keys()):
         today_holding = g.today_positions.get(code, 0)
         if today_holding < 100:
             continue
         try:
-            snapshot = get_snapshot(code)
-            price = 0
-            if snapshot and code in snapshot:
-                price = snapshot[code].get('last_px', 0)
+            # 用实际可卖数量
+            closeable = _get_closeable_amount(code)
+            if closeable <= 0:
+                closeable = today_holding  # 回测fallback
+            sell_amount = _round_lot(closeable)
+            if sell_amount < 100:
+                continue
 
-            if price <= 0:
-                order_id = order(code, -today_holding)
+            sell_price = _get_sell_price(code)
+            if sell_price and sell_price > 0:
+                order_id = order(code, -sell_amount, limit_price=sell_price)
             else:
-                order_id = order(code, -today_holding, limit_price=price)
+                order_id = order(code, -sell_amount)
+                sell_price = g.today_buy_prices.get(code, 0)
 
             if order_id:
-                buy_price = g.today_buy_prices.get(code, price)
-                pnl = (price - buy_price) / buy_price * 100 if buy_price > 0 else 0
+                buy_price = g.today_buy_prices.get(code, sell_price)
+                pnl = (sell_price - buy_price) / buy_price * 100 if buy_price > 0 else 0
                 log.info('[14:55清仓] %s(%s) | 价:%.3f | 量:%d | 盈亏:%.2f%%' % (
-                    _etf_name(code), code, price, today_holding, pnl))
+                    _etf_name(code), code, sell_price, sell_amount, pnl))
                 g.today_positions[code] = 0
                 cleared = True
         except Exception as e:
@@ -920,8 +1056,8 @@ def _print_daily_summary(context):
         buy_px = g.today_buy_prices[code]
         remaining = g.today_positions.get(code, 0)
         try:
-            snapshot = get_snapshot(code)
-            last_px = snapshot[code].get('last_px', buy_px) if snapshot and code in snapshot else buy_px
+            snap = _get_snap(code)
+            last_px = float(snap.get('last_px', buy_px)) if snap else buy_px
         except Exception:
             last_px = buy_px
 
