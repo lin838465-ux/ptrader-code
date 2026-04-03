@@ -254,6 +254,11 @@ def handle_data(context, data):
     if current_time < g.start_trade_time or current_time >= g.clear_time:
         return
 
+    # 每5分钟打印一次全局监控面板
+    minute = now.minute
+    if minute % 5 == 0:
+        _print_monitor_panel(context, now)
+
     # 优先扫描主力池，再扫备选池
     for code in g.etf_pool:
         if code in g.trend_blocked:
@@ -285,14 +290,25 @@ def _process_single_etf(context, code, now):
     if current_price <= 0 or vwap <= 0:
         return
 
-    # ── 每分钟记录累计成交量，用于缩放量判断 ──
-    cum_vol = snap.get('business_amount', 0)  # 当日累计成交量
+    # ── 每分钟记录累计成交量 ──
+    cum_vol = snap.get('business_amount', 0)
     if code not in g.volume_history:
         g.volume_history[code] = []
     g.volume_history[code].append((cum_vol, current_price))
-    # 保留全天数据（09:50~14:55 约300分钟），用于全日量比计算
     if len(g.volume_history[code]) > 310:
         g.volume_history[code] = g.volume_history[code][-310:]
+
+    # ── 计算通用指标 ──
+    vwap_pct = (current_price / vwap - 1) * 100        # 偏离均价线%
+    open_pct = (current_price / open_px - 1) * 100 if open_px > 0 else 0  # 涨跌幅%
+    vol_status = _check_volume_shrink(code)
+    short_r, day_r = _get_volume_ratio(code)
+    vol_tag = {'shrinking': '缩量', 'expanding': '放量', 'neutral': '--'}.get(vol_status, '--')
+    prev_price = g.prev_prices.get(code, 0)
+    price_dir = '↑' if (prev_price > 0 and current_price > prev_price) else (
+                '↓' if (prev_price > 0 and current_price < prev_price) else '→')
+    g.prev_prices[code] = current_price
+    name = _etf_name(code)
 
     today_holding = g.today_positions.get(code, 0)
 
@@ -304,11 +320,32 @@ def _process_single_etf(context, code, now):
         pnl_pct = (current_price - buy_price) / buy_price
         sold_stages = g.today_sold_stage.get(code, set())
 
+        # ── 持仓监控日志（每分钟打印）──
+        log.info('[持仓监控] %s | 价:%s%.3f | 成本:%.3f | 盈亏:%+.2f%% | VWAP偏离:%+.2f%% | %s(短:%.2f/日:%.2f) | 档:%s' % (
+            name, price_dir, current_price, buy_price, pnl_pct * 100,
+            vwap_pct, vol_tag, short_r, day_r, list(sold_stages)))
+
         # ── 快止损：-1% 立即全卖 ──
         if pnl_pct <= -g.stop_loss_pct:
             _sell_all_today(context, code, current_price,
                             '快止损 %.2f%% (买入:%.3f)' % (pnl_pct * 100, buy_price))
             return
+
+        # ── 上涨缩量：涨不动了，提前卖出 ──
+        # 盈利状态 + 价格在涨或持平 + 成交量明显萎缩 = 上涨没后劲
+        if pnl_pct > 0 and vol_status == 'shrinking' and price_dir != '↓':
+            remaining = g.today_positions.get(code, 0)
+            if remaining >= 200:  # 至少留100股观察
+                sell_amt = _round_lot(remaining // 2)
+                if sell_amt >= 100:
+                    log.info('[量能预警] %s 上涨缩量！涨不动了，主动减仓' % name)
+                    _do_sell(context, code, sell_amt, current_price,
+                             '上涨缩量减仓 +%.2f%% (短:%.2f/日:%.2f)' % (pnl_pct * 100, short_r, day_r))
+                    return
+
+        # ── 放量上涨：有后劲，先拿着 ──
+        if pnl_pct > 0 and vol_status == 'expanding':
+            log.info('[量能提示] %s 放量上涨中，有后劲，继续持有' % name)
 
         # ── 第一档：+1% 卖1/3 ──
         if pnl_pct >= g.sell_target_1 and 1 not in sold_stages:
@@ -352,6 +389,7 @@ def _process_single_etf(context, code, now):
             return
 
     # 条件1：日内有足够波动（排除横盘ETF）
+    intraday_range = 0
     if high_px > 0 and low_px > 0:
         intraday_range = (high_px - low_px) / low_px
         if intraday_range < g.min_intraday_vol:
@@ -360,24 +398,28 @@ def _process_single_etf(context, code, now):
     # 条件2：当前价 ≤ VWAP × (1 - buy_dip_pct)
     buy_threshold = vwap * (1 - g.buy_dip_pct)
     if current_price > buy_threshold:
-        g.prev_prices[code] = current_price
         return
 
-    # 条件3：企稳确认 — 当前价格 ≥ 上一分钟价格（止跌回稳）
-    prev_price = g.prev_prices.get(code, 0)
-    g.prev_prices[code] = current_price
+    # ── 进入买入候选区，打印详细日志 ──
+    log.info('[买入观察] %s | 价:%s%.3f | VWAP:%.3f(%+.2f%%) | 涨跌:%+.2f%% | 振幅:%.2f%% | %s(短:%.2f/日:%.2f)' % (
+        name, price_dir, current_price, vwap, vwap_pct,
+        open_pct, intraday_range * 100, vol_tag, short_r, day_r))
+
+    # 条件3：企稳确认 — 不再继续下跌
     if prev_price > 0 and current_price < prev_price:
-        return  # 还在跌，等止跌
-
-    # 条件4：缩量确认 — 下跌时成交量在萎缩，说明卖盘枯竭
-    vol_status = _check_volume_shrink(code)
-    if vol_status == 'expanding':
-        # 放量下跌，卖盘还很猛，不买
-        log.info('[量能过滤] %s(%s) 放量下跌中，暂不买入' % (_etf_name(code), code))
+        log.info('[买入等待] %s 价格还在跌(%.3f→%.3f)，等企稳' % (name, prev_price, current_price))
         return
+
+    # 条件4：缩量确认 — 卖盘枯竭才接
+    if vol_status == 'expanding':
+        log.info('[买入拒绝] %s 放量下跌！卖盘还很猛，不接刀 (短:%.2f/日:%.2f)' % (name, short_r, day_r))
+        return
+    elif vol_status == 'shrinking':
+        log.info('[买入信号] %s 缩量下跌！卖盘枯竭，准备买入 (短:%.2f/日:%.2f)' % (name, short_r, day_r))
 
     # 条件5：当日有过上涨（high > open），说明有弹性
     if open_px > 0 and high_px <= open_px:
+        log.info('[买入拒绝] %s 全天没涨过，没弹性' % name)
         return
 
     # 仓位检查
@@ -385,6 +427,66 @@ def _process_single_etf(context, code, now):
         return
 
     _do_buy(context, code, current_price, vwap, now, vol_status)
+
+
+# ─────────────────────────────────────────────────────────────
+# 全局监控面板（每5分钟打印）
+# ─────────────────────────────────────────────────────────────
+
+def _print_monitor_panel(context, now):
+    """每5分钟打印所有标的的实时状态，便于盯盘和复盘"""
+    time_str = now.strftime('%H:%M')
+    log.info('┌─────────────── 监控面板 %s ───────────────┐' % time_str)
+
+    for code in g.etf_pool:
+        if code in g.trend_blocked:
+            continue
+        try:
+            snapshot = get_snapshot(code)
+            if not snapshot:
+                continue
+            snap = snapshot.get(code, snapshot.get(code.split('.')[0], None))
+            if not snap:
+                continue
+
+            px = snap.get('last_px', 0)
+            vwap = snap.get('wavg_px', 0)
+            open_px = snap.get('open_px', 0)
+            high_px = snap.get('high_px', 0)
+            low_px = snap.get('low_px', 0)
+            if px <= 0 or vwap <= 0:
+                continue
+
+            vwap_pct = (px / vwap - 1) * 100
+            open_pct = (px / open_px - 1) * 100 if open_px > 0 else 0
+            amp = (high_px - low_px) / low_px * 100 if low_px > 0 else 0
+            vol_st = _check_volume_shrink(code)
+            short_r, day_r = _get_volume_ratio(code)
+            vol_tag = {'shrinking': '缩量', 'expanding': '放量', 'neutral': '--'}.get(vol_st, '--')
+
+            # 判断当前状态
+            holding = g.today_positions.get(code, 0)
+            if holding > 0:
+                buy_px = g.today_buy_prices.get(code, px)
+                pnl = (px - buy_px) / buy_px * 100
+                status = '持仓%+.2f%%' % pnl
+            elif px <= vwap * (1 - g.buy_dip_pct):
+                status = '★接近买点'
+            else:
+                status = '观望'
+
+            name = _etf_name(code)
+            # 限制名称长度
+            if len(name) > 8:
+                name = name[:8]
+            log.info('│ %s | %.3f | VWAP:%+.2f%% | 涨跌:%+.2f%% | 振幅:%.1f%% | %s(短%.1f/日%.1f) | %s' % (
+                name, px, vwap_pct, open_pct, amp, vol_tag, short_r, day_r, status))
+        except Exception:
+            pass
+
+    log.info('│ 今日交易: %d/%d | 现金: %.0f' % (
+        g.today_trades, g.max_trades_per_day, context.portfolio.cash))
+    log.info('└──────────────────────────────────────────────┘')
 
 
 # ─────────────────────────────────────────────────────────────
