@@ -176,6 +176,7 @@ def initialize(context):
     g.volume_history = {}      # {code: [(cumulative_vol, price), ...]} 每分钟快照
     g.vol_shrink_ratio = config.get("缩量判断比例", 0.7)  # 近期量/前期量 < 0.7 = 缩量
     g.vol_lookback = config.get("量能对比分钟数", 5)       # 对比最近5分钟 vs 前5分钟
+    g.last_log_time = {}       # {code: datetime} 控制日志频率，同一标的至少间隔3分钟
 
     # ── 定时任务 ──
     run_daily(context, _reset_daily_state, time='09:25')
@@ -216,6 +217,7 @@ def _reset_daily_state(context):
     g.trend_blocked = set()
     g.prev_prices = {}
     g.volume_history = {}
+    g.last_log_time = {}
     log.info('[日内重置] 状态已清空')
 
     for code in g.etf_pool:
@@ -400,26 +402,37 @@ def _process_single_etf(context, code, now):
     if current_price > buy_threshold:
         return
 
-    # ── 进入买入候选区，打印详细日志 ──
-    log.info('[买入观察] %s | 价:%s%.3f | VWAP:%.3f(%+.2f%%) | 涨跌:%+.2f%% | 振幅:%.2f%% | %s(短:%.2f/日:%.2f)' % (
-        name, price_dir, current_price, vwap, vwap_pct,
-        open_pct, intraday_range * 100, vol_tag, short_r, day_r))
+    # ── 进入买入候选区，打印详细日志（同一标的限频：3分钟一次）──
+    _should_log = True
+    _last_t = g.last_log_time.get(code, None)
+    if _last_t is not None and (now - _last_t).total_seconds() < 180:
+        _should_log = False
+
+    if _should_log:
+        g.last_log_time[code] = now
+        log.info('[买入观察] %s | 价:%s%.3f | VWAP:%.3f(%+.2f%%) | 涨跌:%+.2f%% | 振幅:%.2f%% | %s(短:%.2f/日:%.2f)' % (
+            name, price_dir, current_price, vwap, vwap_pct,
+            open_pct, intraday_range * 100, vol_tag, short_r, day_r))
 
     # 条件3：企稳确认 — 不再继续下跌
     if prev_price > 0 and current_price < prev_price:
-        log.info('[买入等待] %s 价格还在跌(%.3f→%.3f)，等企稳' % (name, prev_price, current_price))
+        if _should_log:
+            log.info('[买入等待] %s 价格还在跌(%.3f→%.3f)，等企稳' % (name, prev_price, current_price))
         return
 
     # 条件4：缩量确认 — 卖盘枯竭才接
     if vol_status == 'expanding':
-        log.info('[买入拒绝] %s 放量下跌！卖盘还很猛，不接刀 (短:%.2f/日:%.2f)' % (name, short_r, day_r))
+        if _should_log:
+            log.info('[买入拒绝] %s 放量下跌！卖盘还很猛，不接刀 (短:%.2f/日:%.2f)' % (name, short_r, day_r))
         return
     elif vol_status == 'shrinking':
+        # 缩量信号重要，无论限频都要打
         log.info('[买入信号] %s 缩量下跌！卖盘枯竭，准备买入 (短:%.2f/日:%.2f)' % (name, short_r, day_r))
 
     # 条件5：当日有过上涨（high > open），说明有弹性
     if open_px > 0 and high_px <= open_px:
-        log.info('[买入拒绝] %s 全天没涨过，没弹性' % name)
+        if _should_log:
+            log.info('[买入拒绝] %s 全天没涨过，没弹性' % name)
         return
 
     # 仓位检查
