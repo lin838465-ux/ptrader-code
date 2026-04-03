@@ -337,7 +337,13 @@ def _sync_holding_state(context):
     actual = None
     for code in positions:
         if positions[code].amount > 0 and _is_strategy_security(code):
-            actual = code
+            # 映射回ETF池中的完整代码，保持格式统一
+            for pool_code in getattr(g, 'codes', []):
+                if _same_security(code, pool_code):
+                    actual = pool_code
+                    break
+            if actual is None:
+                actual = code
             break
     g.current_holding = actual
     if actual is None:
