@@ -83,46 +83,84 @@ def _save_json(filename, data):
 
 def _create_default_config():
     config = {
+        # ═══════════════════════════════════════
+        # 资金配置（用户根据账户情况修改）
+        # ═══════════════════════════════════════
+        "策略分配资金(元)": 300000,          # 本策略可用资金，用户自行分配
+
+        # ═══════════════════════════════════════
+        # 标的池
+        # ═══════════════════════════════════════
         "主力池(高波动优先)": [
-            "513180.SS",   # 恒生科技ETF
-            "513330.SS",   # 恒生互联网ETF
-            "513050.SS",   # 中概互联ETF
-            "162411.SZ",   # 华宝油气ETF
-            "513100.SS",   # 纳斯达克ETF
-            "159518.SZ",   # 日经ETF
-            "513310.SS"    # 港股科技30ETF
+            "513180.SS",   # 恒生科技ETF     日均30亿+ 波动3%-5%
+            "513330.SS",   # 恒生互联网ETF   日均15亿+ 波动3%-5%
+            "513050.SS",   # 中概互联ETF     日均12亿+ 波动3%-4%
+            "162411.SZ",   # 华宝油气ETF     日均8亿+  波动4%-8%
+            "513100.SS",   # 纳斯达克ETF     日均20亿+ 波动2%-4%
+            "159518.SZ",   # 日经ETF         跨境T+0
+            "513310.SS"    # 港股科技30ETF   波动3%-5%
         ],
         "备选池(稳健补充)": [
-            "518880.SS",   # 黄金ETF
-            "520500.SS",   # 恒生创新药ETF
-            "159608.SZ",   # 稀有金属ETF
-            "159985.SZ",   # 豆粕ETF
-            "159981.SZ",   # 能源化工ETF
-            "159286.SZ"    # 碳中和ETF
+            "518880.SS",   # 黄金ETF(华安)   日均50亿+ 波动1%-3%
+            "520500.SS",   # 恒生创新药ETF   波动4%-6%
+            "159608.SZ",   # 稀有金属ETF     波动3%-6%
+            "159985.SZ",   # 豆粕ETF         波动3%-5%
+            "159981.SZ",   # 能源化工ETF     波动3%-5%
+            "159286.SZ"    # 碳中和ETF       波动2%-4%
         ],
         "启用备选池": True,
-        "买入低于均线比例(%)": 1.0,
-        "第一档卖出收益(%)": 1.0,
-        "第二档卖出收益(%)": 1.5,
-        "第三档卖出收益(%)": 2.0,
-        "止损比例(%)": 1.0,
-        "最大总仓位比例": 0.3,
-        "单标的最大仓位比例": 0.12,
-        "每日最大交易次数": 2,
+
+        # ═══════════════════════════════════════
+        # 买卖核心参数（均线做T逻辑）
+        # ═══════════════════════════════════════
+        "买入低于均线比例(%)": 1.0,          # VWAP下1%买入
+        "第一档卖出收益(%)": 1.0,            # 买入价上1%卖1/3
+        "第二档卖出收益(%)": 1.5,            # 买入价上1.5%再卖1/3
+        "第三档卖出收益(%)": 2.0,            # 买入价上2%清仓
+        "止损比例(%)": 1.0,                  # 买入价下1%全卖
+
+        # ═══════════════════════════════════════
+        # 交易频次与仓位控制
+        # ═══════════════════════════════════════
+        "每日最大交易次数": 3,               # 全天最多买入3次
+        "同时最大持仓ETF数": 2,              # 同时最多持有2只ETF
+        "单标的每日最多交易次数": 1,          # 同一只ETF一天只做1次T
+        "单笔买入金额(元)": 100000,          # 每次买入10万（不超过分配资金的1/3）
+
+        # ═══════════════════════════════════════
+        # 手续费
+        # ═══════════════════════════════════════
         "手续费率": 0.0001,
         "最低手续费(元)": 5.0,
+
+        # ═══════════════════════════════════════
+        # 过滤条件
+        # ═══════════════════════════════════════
         "趋势判断均线天数": 5,
         "趋势判断跌幅阈值(%)": 3.0,
         "日内波动率最低要求(%)": 1.0,
-        "清仓时间": "14:55",
+        "委比买入下限": -20,                 # 委比低于-20%不买（卖盘挂单太多）
+        "标的最低日均成交额(万)": 5000,
+
+        # ═══════════════════════════════════════
+        # 时间与冷却
+        # ═══════════════════════════════════════
         "开始交易时间": "09:50",
+        "清仓时间": "14:55",
         "买入冷却分钟数": 15,
-        "缩量判断比例": 0.7,
-        "量能对比分钟数": 5,
+
+        # ═══════════════════════════════════════
+        # 大盘过滤
+        # ═══════════════════════════════════════
         "大盘基准": "000300.SS",
         "大盘放量暴跌暂停阈值(%)": -1.5,
-        "标的最低日均成交额(万)": 5000,
-        "成交额对比天数": 5
+        "成交额对比天数": 5,
+
+        # ═══════════════════════════════════════
+        # 量能参数（用于大盘分钟量回退判断）
+        # ═══════════════════════════════════════
+        "缩量判断比例": 0.7,
+        "量能对比分钟数": 5
     }
     _save_json('etf_t0_config.json', config)
     log.info('[配置] 已创建默认配置文件 etf_t0_config.json')
@@ -143,6 +181,10 @@ def _load_config():
 def initialize(context):
     config = _load_config()
 
+    # ── 资金配置 ──
+    g.allocated_capital = config.get("策略分配资金(元)", 300000)
+    g.buy_amount_per_trade = config.get("单笔买入金额(元)", 100000)
+
     # ── 标的池：主力 + 备选 ──
     g.primary_pool = config.get("主力池(高波动优先)", [
         "513180.SS", "513330.SS", "513050.SS", "162411.SZ",
@@ -156,45 +198,55 @@ def initialize(context):
     g.etf_pool = g.primary_pool + (g.secondary_pool if g.use_secondary else [])
     set_universe(g.etf_pool)
 
-    # ── 策略参数 ──
-    g.buy_dip_pct = config.get("买入低于均线比例(%)", 1.0) / 100.0
-    g.sell_target_1 = config.get("第一档卖出收益(%)", 1.0) / 100.0     # +1% 卖1/3
-    g.sell_target_2 = config.get("第二档卖出收益(%)", 1.5) / 100.0     # +1.5% 再卖1/3
-    g.sell_target_3 = config.get("第三档卖出收益(%)", 2.0) / 100.0     # +2% 清仓
-    g.stop_loss_pct = config.get("止损比例(%)", 1.0) / 100.0           # -1% 快止损
-    g.max_position = config.get("最大总仓位比例", 0.3)
-    g.max_single_position = config.get("单标的最大仓位比例", 0.12)
-    g.max_trades_per_day = config.get("每日最大交易次数", 2)
+    # ── 买卖核心参数（均线做T逻辑，这是策略灵魂，不会变）──
+    g.buy_dip_pct = config.get("买入低于均线比例(%)", 1.0) / 100.0       # VWAP下1%买入
+    g.sell_target_1 = config.get("第一档卖出收益(%)", 1.0) / 100.0       # +1% 卖1/3
+    g.sell_target_2 = config.get("第二档卖出收益(%)", 1.5) / 100.0       # +1.5% 再卖1/3
+    g.sell_target_3 = config.get("第三档卖出收益(%)", 2.0) / 100.0       # +2% 清仓
+    g.stop_loss_pct = config.get("止损比例(%)", 1.0) / 100.0             # -1% 快止损
+
+    # ── 交易频次与仓位 ──
+    g.max_trades_per_day = config.get("每日最大交易次数", 3)
+    g.max_concurrent_etf = config.get("同时最大持仓ETF数", 2)
+    g.max_trades_per_etf = config.get("单标的每日最多交易次数", 1)
     g.commission_rate = config.get("手续费率", 0.0001)
     g.min_commission = config.get("最低手续费(元)", 5.0)
+
+    # ── 过滤条件 ──
     g.trend_ma_days = config.get("趋势判断均线天数", 5)
     g.trend_drop_threshold = config.get("趋势判断跌幅阈值(%)", 3.0) / 100.0
     g.min_intraday_vol = config.get("日内波动率最低要求(%)", 1.0) / 100.0
+    g.min_entrust_rate = config.get("委比买入下限", -20)                  # 委比低于此值不买
+    g.min_daily_amount = config.get("标的最低日均成交额(万)", 5000) * 10000
+
+    # ── 时间 ──
     g.start_trade_time = config.get("开始交易时间", "09:50")
     g.clear_time = config.get("清仓时间", "14:55")
     g.buy_cooldown_min = config.get("买入冷却分钟数", 15)
 
-    # ── 日内状态（每日重置）──
-    g.today_trades = 0
-    g.today_buy_prices = {}    # {code: 买入价}
-    g.today_sold_stage = {}    # {code: set(已卖出的档位)}
-    g.last_buy_time = {}       # {code: datetime}
-    g.today_positions = {}     # {code: 持仓数量}
-    g.trend_blocked = set()
-    g.prev_prices = {}         # {code: 上一分钟价格} 用于判断企稳
-    g.volume_history = {}      # {code: [(cumulative_vol, price), ...]} 每分钟快照
+    # ── 大盘过滤 ──
+    g.market_benchmark = config.get("大盘基准", "000300.SS")
+    g.market_crash_threshold = config.get("大盘放量暴跌暂停阈值(%)", -1.5) / 100.0
+    g.amount_compare_days = config.get("成交额对比天数", 5)
+
+    # ── 量能参数（大盘分钟量回退判断）──
     g.vol_shrink_ratio = config.get("缩量判断比例", 0.7)
     g.vol_lookback = config.get("量能对比分钟数", 5)
-    g.last_log_time = {}
 
-    # ── V3新增：大盘过滤 + 流动性 + 日均成交额 ──
-    g.market_benchmark = config.get("大盘基准", "000300.SS")       # 沪深300
-    g.market_crash_threshold = config.get("大盘放量暴跌暂停阈值(%)", -1.5) / 100.0
-    g.min_daily_amount = config.get("标的最低日均成交额(万)", 5000) * 10000  # 转为元
-    g.amount_compare_days = config.get("成交额对比天数", 5)
-    g.market_paused = False    # 大盘暴跌暂停标志
-    g.etf_avg_amounts = {}     # {code: 近5日日均成交额} 盘前计算
-    g.etf_today_vol_ratio = {} # {code: 今日成交额/近5日均值} 实时更新
+    # ── 日内状态（每日重置）──
+    g.today_trades = 0
+    g.today_buy_prices = {}     # {code: 买入价}
+    g.today_sold_stage = {}     # {code: set(已卖出的档位)}
+    g.last_buy_time = {}        # {code: datetime}
+    g.today_positions = {}      # {code: 持仓数量}
+    g.today_etf_trades = {}     # {code: 该标的今日已交易次数}
+    g.today_used_capital = 0    # 当日已用资金
+    g.trend_blocked = set()
+    g.prev_prices = {}
+    g.volume_history = {}       # 大盘分钟量记录
+    g.last_log_time = {}
+    g.market_paused = False
+    g.etf_avg_amounts = {}
 
     # ── 定时任务 ──
     run_daily(context, _reset_daily_state, time='09:25')
@@ -204,6 +256,7 @@ def initialize(context):
     log.info('═══════════════════════════════════════════════')
     log.info('  ETF T+0 做T策略 V3 已初始化')
     log.info('─────────────────────────────────────────────')
+    log.info('  策略资金: %.0f元 | 单笔: %.0f元' % (g.allocated_capital, g.buy_amount_per_trade))
     log.info('  主力池(%d只):' % len(g.primary_pool))
     for c in g.primary_pool:
         log.info('    %s %s' % (c, _etf_name(c)))
@@ -212,12 +265,12 @@ def initialize(context):
         for c in g.secondary_pool:
             log.info('    %s %s' % (c, _etf_name(c)))
     log.info('─────────────────────────────────────────────')
-    log.info('  买入: VWAP下 %.1f%%' % (g.buy_dip_pct * 100))
-    log.info('  卖出: +%.1f%% / +%.1f%% / +%.1f%%' % (
-        g.sell_target_1 * 100, g.sell_target_2 * 100, g.sell_target_3 * 100))
-    log.info('  止损: -%.1f%% (快止损)' % (g.stop_loss_pct * 100))
-    log.info('  仓位: 总≤%.0f%% 单≤%.0f%%' % (g.max_position * 100, g.max_single_position * 100))
-    log.info('  量能: 缩量比≤%.0f%% 才买入(对比%d分钟窗口)' % (g.vol_shrink_ratio * 100, g.vol_lookback))
+    log.info('  核心逻辑: VWAP下%.1f%%买 → +%.1f%%/+%.1f%%/+%.1f%%分档卖 → -%.1f%%止损' % (
+        g.buy_dip_pct * 100, g.sell_target_1 * 100, g.sell_target_2 * 100,
+        g.sell_target_3 * 100, g.stop_loss_pct * 100))
+    log.info('  频次: 每日≤%d笔 | 同时≤%d只 | 单标的≤%d次/天' % (
+        g.max_trades_per_day, g.max_concurrent_etf, g.max_trades_per_etf))
+    log.info('  辅助过滤: 量比+换手率+内外盘+委比(≥%d)+大盘情绪' % g.min_entrust_rate)
     log.info('  交易窗口: %s ~ %s' % (g.start_trade_time, g.clear_time))
     log.info('═══════════════════════════════════════════════')
 
@@ -236,9 +289,10 @@ def _reset_daily_state(context):
     g.prev_prices = {}
     g.volume_history = {}
     g.last_log_time = {}
+    g.today_etf_trades = {}
+    g.today_used_capital = 0
     g.market_paused = False
-    g.etf_today_vol_ratio = {}
-    log.info('[日内重置] 状态已清空')
+    log.info('[日内重置] 状态已清空 | 今日可用资金: %.0f元' % g.allocated_capital)
 
     # ── 趋势过滤 ──
     for code in g.etf_pool:
@@ -553,13 +607,23 @@ def _process_single_etf(context, code, now):
     if today_holding > 0 or g.today_trades >= g.max_trades_per_day:
         return
 
-    # 大盘暂停检查：大盘放量暴跌时只管持仓止盈止损，不新开仓
+    # 大盘暂停
     if g.market_paused:
         return
 
-    # 日成交额量比：今日成交额 vs 近5日均值（文档要求缩量>30%才买）
-    daily_vol_ratio = _get_today_vol_ratio(code, snap)
-    g.etf_today_vol_ratio[code] = daily_vol_ratio
+    # 同时持仓ETF数量限制
+    concurrent = sum(1 for v in g.today_positions.values() if v > 0)
+    if concurrent >= g.max_concurrent_etf:
+        return
+
+    # 单标的每日交易次数限制
+    etf_trades = g.today_etf_trades.get(code, 0)
+    if etf_trades >= g.max_trades_per_etf:
+        return
+
+    # 资金限制：已用资金 + 本次买入 不超过分配资金
+    if g.today_used_capital + g.buy_amount_per_trade > g.allocated_capital:
+        return
 
     # 冷却检查
     last_buy = g.last_buy_time.get(code, None)
@@ -612,8 +676,12 @@ def _process_single_etf(context, code, now):
             log.info('[买入拒绝] %s 全天没涨过，没弹性' % name)
         return
 
-    # 仓位检查
-    if not _check_position_limit(context, code):
+    # 条件6：委比过滤 — 卖盘挂单远多于买盘时不买
+    entrust_rate = snap.get('entrust_rate', 0)
+    if entrust_rate < g.min_entrust_rate:
+        if _should_log:
+            log.info('[买入拒绝] %s 委比%.1f%%太低(下限%d%%)，卖盘挂单过多' % (
+                name, entrust_rate, g.min_entrust_rate))
         return
 
     _do_buy(context, code, current_price, vwap, now, vol_status)
@@ -673,8 +741,10 @@ def _print_monitor_panel(context, now):
             pass
 
     mkt_status = '暂停买入' if g.market_paused else '正常'
-    log.info('│ 今日交易: %d/%d | 现金: %.0f | 大盘: %s' % (
-        g.today_trades, g.max_trades_per_day, context.portfolio.cash, mkt_status))
+    concurrent = sum(1 for v in g.today_positions.values() if v > 0)
+    log.info('│ 交易:%d/%d | 持仓:%d/%d只 | 已用:%.0f/%.0f | 大盘:%s' % (
+        g.today_trades, g.max_trades_per_day, concurrent, g.max_concurrent_etf,
+        g.today_used_capital, g.allocated_capital, mkt_status))
     log.info('└──────────────────────────────────────────────┘')
 
 
@@ -789,23 +859,30 @@ def _check_volume_shrink(code):
 # ─────────────────────────────────────────────────────────────
 
 def _do_buy(context, code, price, vwap, now, vol_status='neutral'):
-    total_value = context.portfolio.total_value
-    buy_value = total_value * g.max_single_position
+    # 用配置的固定金额买入，不依赖账户总资产
+    buy_value = min(g.buy_amount_per_trade, g.allocated_capital - g.today_used_capital)
+    if buy_value < 1000:
+        return
     buy_amount = _round_lot(int(buy_value / price))
     if buy_amount < 100:
         return
 
-    commission = max(buy_value * g.commission_rate, g.min_commission)
+    commission = max(buy_amount * price * g.commission_rate, g.min_commission)
     order_id = order(code, buy_amount, limit_price=price)
     if order_id:
+        actual_cost = buy_amount * price
         g.today_buy_prices[code] = price
         g.today_positions[code] = buy_amount
         g.today_trades += 1
+        g.today_etf_trades[code] = g.today_etf_trades.get(code, 0) + 1
+        g.today_used_capital += actual_cost
         g.last_buy_time[code] = now
         g.today_sold_stage[code] = set()
-        log.info('[买入] %s(%s) | 价:%.3f | VWAP:%.3f | 偏离:%.2f%% | 量:%d | 费:%.1f | %s' % (
+        log.info('[买入] %s(%s) | 价:%.3f | VWAP:%.3f(偏离%+.2f%%) | 量:%d | 金额:%.0f | 费:%.1f | %s' % (
             _etf_name(code), code, price, vwap,
-            (price / vwap - 1) * 100, buy_amount, commission, vol_status))
+            (price / vwap - 1) * 100, buy_amount, actual_cost, commission, vol_status))
+        log.info('[资金] 已用:%.0f / 分配:%.0f | 今日交易:%d/%d' % (
+            g.today_used_capital, g.allocated_capital, g.today_trades, g.max_trades_per_day))
 
 
 def _do_sell(context, code, amount, price, reason):
@@ -814,8 +891,11 @@ def _do_sell(context, code, amount, price, reason):
     order_id = order(code, -amount, limit_price=price)
     if order_id:
         g.today_positions[code] = max(g.today_positions.get(code, 0) - amount, 0)
-        log.info('[卖出] %s(%s) | 价:%.3f | 量:%d | %s' % (
-            _etf_name(code), code, price, amount, reason))
+        # 卖出回收资金
+        sell_value = amount * price
+        g.today_used_capital = max(g.today_used_capital - sell_value, 0)
+        log.info('[卖出] %s(%s) | 价:%.3f | 量:%d | 回收:%.0f | %s' % (
+            _etf_name(code), code, price, amount, sell_value, reason))
 
 
 def _sell_all_today(context, code, price, reason):
@@ -859,31 +939,7 @@ def _force_clear_all(context):
         log.info('[14:55清仓] 今日无持仓需清理')
 
 
-# ─────────────────────────────────────────────────────────────
-# 仓位控制
-# ─────────────────────────────────────────────────────────────
-
-def _check_position_limit(context, code):
-    total_value = context.portfolio.total_value
-    if total_value <= 0:
-        return False
-
-    total_pos_value = 0
-    for pos_code, pos in context.portfolio.positions.items():
-        if pos.amount > 0:
-            total_pos_value += pos.amount * pos.last_sale_price
-
-    for t_code, t_amount in g.today_positions.items():
-        if t_code != code and t_amount > 0:
-            buy_px = g.today_buy_prices.get(t_code, 0)
-            if buy_px > 0:
-                total_pos_value += t_amount * buy_px
-
-    if total_pos_value / total_value >= g.max_position:
-        log.info('[仓位限制] 总仓位 %.1f%% 已达上限' % (total_pos_value / total_value * 100))
-        return False
-
-    return True
+# （仓位控制已改为资金配置模式，在买入条件中直接检查）
 
 
 def _round_lot(amount):
