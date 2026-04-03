@@ -1,13 +1,18 @@
 # ═══════════════════════════════════════════════════════════════
-# ETF T+0 日内做T策略 V2 - PTrade
+# ETF T+0 日内做T策略 V3 - PTrade
 # ─────────────────────────────────────────────────────────────
 # 核心逻辑：
 #   - 标的池分主力/备选，优先交易高波动ETF
-#   - 买入条件：实时价 ≤ VWAP × (1 - 1%)，且有企稳迹象
-#   - 卖出条件：买入价 +1% 卖1/3，+1.5% 再卖1/3，+2% 清仓
+#   - 买入条件：VWAP下1% + 缩量确认 + 企稳 + 大盘不崩
+#   - 卖出条件：分三档止盈 + 上涨缩量主动减仓
 #   - 止损：买入价 -1% 全部卖出（快止损）
 #   - 14:55 强制清仓，绝不留隔夜仓
-#   - 趋势过滤 + 日内放量下跌过滤
+#
+# V3新增（参考深化需求文档）：
+#   - 沪深300大盘情绪过滤：大盘放量暴跌时暂停买入
+#   - 当日成交额 vs 近5日均值：量比维度更准确
+#   - 流动性过滤：成交额过低的标的跳过
+#   - 卖出放量确认：放量上涨时延迟止盈，缩量上涨加速止盈
 #
 # 盈亏比：赚1%~2% vs 亏1%，胜率>43%即可盈利
 # ═══════════════════════════════════════════════════════════════
@@ -113,7 +118,11 @@ def _create_default_config():
         "开始交易时间": "09:50",
         "买入冷却分钟数": 15,
         "缩量判断比例": 0.7,
-        "量能对比分钟数": 5
+        "量能对比分钟数": 5,
+        "大盘基准": "000300.SS",
+        "大盘放量暴跌暂停阈值(%)": -1.5,
+        "标的最低日均成交额(万)": 5000,
+        "成交额对比天数": 5
     }
     _save_json('etf_t0_config.json', config)
     log.info('[配置] 已创建默认配置文件 etf_t0_config.json')
@@ -174,9 +183,18 @@ def initialize(context):
     g.trend_blocked = set()
     g.prev_prices = {}         # {code: 上一分钟价格} 用于判断企稳
     g.volume_history = {}      # {code: [(cumulative_vol, price), ...]} 每分钟快照
-    g.vol_shrink_ratio = config.get("缩量判断比例", 0.7)  # 近期量/前期量 < 0.7 = 缩量
-    g.vol_lookback = config.get("量能对比分钟数", 5)       # 对比最近5分钟 vs 前5分钟
-    g.last_log_time = {}       # {code: datetime} 控制日志频率，同一标的至少间隔3分钟
+    g.vol_shrink_ratio = config.get("缩量判断比例", 0.7)
+    g.vol_lookback = config.get("量能对比分钟数", 5)
+    g.last_log_time = {}
+
+    # ── V3新增：大盘过滤 + 流动性 + 日均成交额 ──
+    g.market_benchmark = config.get("大盘基准", "000300.SS")       # 沪深300
+    g.market_crash_threshold = config.get("大盘放量暴跌暂停阈值(%)", -1.5) / 100.0
+    g.min_daily_amount = config.get("标的最低日均成交额(万)", 5000) * 10000  # 转为元
+    g.amount_compare_days = config.get("成交额对比天数", 5)
+    g.market_paused = False    # 大盘暴跌暂停标志
+    g.etf_avg_amounts = {}     # {code: 近5日日均成交额} 盘前计算
+    g.etf_today_vol_ratio = {} # {code: 今日成交额/近5日均值} 实时更新
 
     # ── 定时任务 ──
     run_daily(context, _reset_daily_state, time='09:25')
@@ -184,7 +202,7 @@ def initialize(context):
     run_daily(context, _print_daily_summary, time='15:05')
 
     log.info('═══════════════════════════════════════════════')
-    log.info('  ETF T+0 做T策略 V2 已初始化')
+    log.info('  ETF T+0 做T策略 V3 已初始化')
     log.info('─────────────────────────────────────────────')
     log.info('  主力池(%d只):' % len(g.primary_pool))
     for c in g.primary_pool:
@@ -218,15 +236,36 @@ def _reset_daily_state(context):
     g.prev_prices = {}
     g.volume_history = {}
     g.last_log_time = {}
+    g.market_paused = False
+    g.etf_today_vol_ratio = {}
     log.info('[日内重置] 状态已清空')
 
+    # ── 趋势过滤 ──
     for code in g.etf_pool:
         if _is_downtrend(code):
             g.trend_blocked.add(code)
             log.info('[趋势过滤] %s(%s) 近期下跌趋势，今日不开仓' % (_etf_name(code), code))
 
+    # ── 流动性过滤：计算近N日日均成交额，过低的屏蔽 ──
+    g.etf_avg_amounts = {}
+    for code in g.etf_pool:
+        if code in g.trend_blocked:
+            continue
+        avg_amt = _get_avg_daily_amount(code, g.amount_compare_days)
+        g.etf_avg_amounts[code] = avg_amt
+        if avg_amt > 0 and avg_amt < g.min_daily_amount:
+            g.trend_blocked.add(code)
+            log.info('[流动性过滤] %s(%s) 日均成交额%.0f万 < %.0f万，今日不交易' % (
+                _etf_name(code), code, avg_amt / 10000, g.min_daily_amount / 10000))
+        elif avg_amt > 0:
+            log.info('[流动性] %s 日均成交额: %.0f万' % (_etf_name(code), avg_amt / 10000))
+
+    # ── 大盘趋势检查 ──
+    if _is_downtrend(g.market_benchmark):
+        log.warning('[大盘预警] 沪深300近期下跌趋势，今日降低操作频率')
+
     active = len(g.etf_pool) - len(g.trend_blocked)
-    log.info('[趋势过滤] 今日可交易: %d / %d' % (active, len(g.etf_pool)))
+    log.info('[盘前汇总] 今日可交易: %d / %d' % (active, len(g.etf_pool)))
 
 
 def _is_downtrend(code):
@@ -245,6 +284,102 @@ def _is_downtrend(code):
         return False
 
 
+def _get_avg_daily_amount(code, days):
+    """获取近N日的日均成交额（元）"""
+    try:
+        hist = get_history(days, '1d', 'money', code, fq='pre', include=False)
+        if hist is None or len(hist) == 0:
+            return 0
+        amounts = list(hist[code])
+        valid = [a for a in amounts if a and a > 0]
+        return sum(valid) / len(valid) if valid else 0
+    except Exception as e:
+        log.warning('[成交额查询异常] %s: %s' % (code, str(e)))
+        return 0
+
+
+def _check_market_sentiment(now):
+    """检查大盘（沪深300）实时情绪
+
+    判断逻辑：
+    - 大盘跌幅超过阈值(如-1.5%) 且 放量 → 系统性风险，暂停买入
+    - 大盘缩量企稳 → 正常交易
+
+    返回: True=可以交易, False=暂停买入
+    """
+    try:
+        snapshot = get_snapshot(g.market_benchmark)
+        if not snapshot:
+            return True  # 拿不到数据不阻止
+
+        snap = snapshot.get(g.market_benchmark, None)
+        if snap is None:
+            # 尝试不带后缀
+            for k in snapshot:
+                snap = snapshot[k]
+                break
+        if snap is None:
+            return True
+
+        px = snap.get('last_px', 0)
+        open_px = snap.get('open_px', 0)
+        if px <= 0 or open_px <= 0:
+            return True
+
+        change_pct = (px / open_px - 1)
+
+        # 大盘放量暴跌 → 暂停
+        if change_pct <= g.market_crash_threshold:
+            # 检查大盘是否放量
+            market_vol_status = _check_volume_shrink(g.market_benchmark)
+            if market_vol_status == 'expanding' or market_vol_status == 'neutral':
+                return False  # 大盘放量跌 或 正常量跌，都危险
+
+        return True
+    except Exception as e:
+        log.warning('[大盘检查异常] %s' % str(e))
+        return True  # 异常时不阻止
+
+
+def _get_today_vol_ratio(code, snap):
+    """计算标的今日成交额 vs 近5日日均成交额的比值
+
+    返回: ratio (如0.6=今日成交额只有平时的60%=缩量日; 1.5=放量日)
+    """
+    avg_amt = g.etf_avg_amounts.get(code, 0)
+    if avg_amt <= 0:
+        return 1.0
+
+    today_amount = snap.get('business_balance', 0)  # 当日累计成交额
+    if today_amount <= 0:
+        return 1.0
+
+    # 估算全日成交额：当前成交额 / 已过交易时间占比
+    import datetime
+    now = datetime.datetime.now()
+    market_start = now.replace(hour=9, minute=30, second=0)
+    market_mid_end = now.replace(hour=11, minute=30, second=0)
+    market_mid_start = now.replace(hour=13, minute=0, second=0)
+    market_end = now.replace(hour=15, minute=0, second=0)
+
+    total_minutes = 240.0  # 全天交易240分钟
+    if now <= market_start:
+        elapsed = 1
+    elif now <= market_mid_end:
+        elapsed = (now - market_start).total_seconds() / 60.0
+    elif now <= market_mid_start:
+        elapsed = 120  # 上午满120分钟
+    elif now <= market_end:
+        elapsed = 120 + (now - market_mid_start).total_seconds() / 60.0
+    else:
+        elapsed = 240
+
+    elapsed = max(elapsed, 1)
+    estimated_full_day = today_amount * (total_minutes / elapsed)
+    ratio = estimated_full_day / avg_amt
+    return ratio
+
+
 # ─────────────────────────────────────────────────────────────
 # 主交易逻辑（每分钟执行）
 # ─────────────────────────────────────────────────────────────
@@ -255,6 +390,35 @@ def handle_data(context, data):
 
     if current_time < g.start_trade_time or current_time >= g.clear_time:
         return
+
+    # ── 记录大盘成交量（用于大盘缩放量判断）──
+    try:
+        mkt_snap = get_snapshot(g.market_benchmark)
+        if mkt_snap:
+            ms = mkt_snap.get(g.market_benchmark, None)
+            if ms is None:
+                for k in mkt_snap:
+                    ms = mkt_snap[k]
+                    break
+            if ms:
+                cum_vol = ms.get('business_amount', 0)
+                if g.market_benchmark not in g.volume_history:
+                    g.volume_history[g.market_benchmark] = []
+                g.volume_history[g.market_benchmark].append((cum_vol, ms.get('last_px', 0)))
+                if len(g.volume_history[g.market_benchmark]) > 310:
+                    g.volume_history[g.market_benchmark] = g.volume_history[g.market_benchmark][-310:]
+    except Exception:
+        pass
+
+    # ── 大盘情绪检查（每分钟）──
+    can_trade = _check_market_sentiment(now)
+    if not can_trade and not g.market_paused:
+        g.market_paused = True
+        log.warning('[大盘熔断] 沪深300放量下跌超%.1f%%，暂停新开仓！只执行持仓止盈止损' % (
+            abs(g.market_crash_threshold) * 100))
+    elif can_trade and g.market_paused:
+        g.market_paused = False
+        log.info('[大盘恢复] 沪深300企稳，恢复正常交易')
 
     # 每5分钟打印一次全局监控面板
     minute = now.minute
@@ -292,20 +456,15 @@ def _process_single_etf(context, code, now):
     if current_price <= 0 or vwap <= 0:
         return
 
-    # ── 每分钟记录累计成交量 ──
-    cum_vol = snap.get('business_amount', 0)
-    if code not in g.volume_history:
-        g.volume_history[code] = []
-    g.volume_history[code].append((cum_vol, current_price))
-    if len(g.volume_history[code]) > 310:
-        g.volume_history[code] = g.volume_history[code][-310:]
-
-    # ── 计算通用指标 ──
-    vwap_pct = (current_price / vwap - 1) * 100        # 偏离均价线%
-    open_pct = (current_price / open_px - 1) * 100 if open_px > 0 else 0  # 涨跌幅%
-    vol_status = _check_volume_shrink(code)
-    short_r, day_r = _get_volume_ratio(code)
-    vol_tag = {'shrinking': '缩量', 'expanding': '放量', 'neutral': '--'}.get(vol_status, '--')
+    # ── 计算通用指标（直接用PTrade snapshot原生字段）──
+    vwap_pct = (current_price / vwap - 1) * 100
+    open_pct = (current_price / open_px - 1) * 100 if open_px > 0 else 0
+    vol_info = _analyze_volume(snap)    # PTrade原生量比/换手率/内外盘
+    vol_status = vol_info['status']
+    vol_tag = vol_info['tag']
+    vol_ratio = vol_info['vol_ratio']
+    turnover = vol_info['turnover']
+    in_out_r = vol_info['in_out_ratio']
     prev_price = g.prev_prices.get(code, 0)
     price_dir = '↑' if (prev_price > 0 and current_price > prev_price) else (
                 '↓' if (prev_price > 0 and current_price < prev_price) else '→')
@@ -323,9 +482,9 @@ def _process_single_etf(context, code, now):
         sold_stages = g.today_sold_stage.get(code, set())
 
         # ── 持仓监控日志（每分钟打印）──
-        log.info('[持仓监控] %s | 价:%s%.3f | 成本:%.3f | 盈亏:%+.2f%% | VWAP偏离:%+.2f%% | %s(短:%.2f/日:%.2f) | 档:%s' % (
+        log.info('[持仓监控] %s | 价:%s%.3f | 成本:%.3f | 盈亏:%+.2f%% | VWAP:%+.2f%% | %s | 换手:%.2f%% | 外/内:%.2f | 档:%s' % (
             name, price_dir, current_price, buy_price, pnl_pct * 100,
-            vwap_pct, vol_tag, short_r, day_r, list(sold_stages)))
+            vwap_pct, vol_tag, turnover, in_out_r, list(sold_stages)))
 
         # ── 快止损：-1% 立即全卖 ──
         if pnl_pct <= -g.stop_loss_pct:
@@ -334,20 +493,31 @@ def _process_single_etf(context, code, now):
             return
 
         # ── 上涨缩量：涨不动了，提前卖出 ──
-        # 盈利状态 + 价格在涨或持平 + 成交量明显萎缩 = 上涨没后劲
+        # 盈利 + 价格在涨或持平 + 量比低 + 外盘减弱 = 上涨没后劲
         if pnl_pct > 0 and vol_status == 'shrinking' and price_dir != '↓':
             remaining = g.today_positions.get(code, 0)
-            if remaining >= 200:  # 至少留100股观察
+            if remaining >= 200:
                 sell_amt = _round_lot(remaining // 2)
                 if sell_amt >= 100:
-                    log.info('[量能预警] %s 上涨缩量！涨不动了，主动减仓' % name)
+                    log.info('[量能预警] %s 上涨缩量！涨不动了，主动减仓 | %s' % (name, vol_tag))
                     _do_sell(context, code, sell_amt, current_price,
-                             '上涨缩量减仓 +%.2f%% (短:%.2f/日:%.2f)' % (pnl_pct * 100, short_r, day_r))
+                             '上涨缩量减仓 +%.2f%% | %s' % (pnl_pct * 100, vol_tag))
                     return
 
-        # ── 放量上涨：有后劲，先拿着 ──
-        if pnl_pct > 0 and vol_status == 'expanding':
-            log.info('[量能提示] %s 放量上涨中，有后劲，继续持有' % name)
+        # ── 放量买入型上涨：有后劲，先拿着 ──
+        if pnl_pct > 0 and vol_status == 'expanding_buy':
+            log.info('[量能提示] %s 放量上涨(外盘主导)，有后劲，继续持有 | %s' % (name, vol_tag))
+
+        # ── 放量卖出型上涨：有人在出货，谨慎 ──
+        if pnl_pct > 0 and vol_status == 'expanding' and in_out_r < 0.8:
+            remaining = g.today_positions.get(code, 0)
+            if remaining >= 200:
+                sell_amt = _round_lot(remaining // 2)
+                if sell_amt >= 100:
+                    log.info('[量能预警] %s 放量但内盘主导(出货迹象)，主动减仓 | %s' % (name, vol_tag))
+                    _do_sell(context, code, sell_amt, current_price,
+                             '放量出货减仓 +%.2f%% | %s' % (pnl_pct * 100, vol_tag))
+                    return
 
         # ── 第一档：+1% 卖1/3 ──
         if pnl_pct >= g.sell_target_1 and 1 not in sold_stages:
@@ -383,6 +553,14 @@ def _process_single_etf(context, code, now):
     if today_holding > 0 or g.today_trades >= g.max_trades_per_day:
         return
 
+    # 大盘暂停检查：大盘放量暴跌时只管持仓止盈止损，不新开仓
+    if g.market_paused:
+        return
+
+    # 日成交额量比：今日成交额 vs 近5日均值（文档要求缩量>30%才买）
+    daily_vol_ratio = _get_today_vol_ratio(code, snap)
+    g.etf_today_vol_ratio[code] = daily_vol_ratio
+
     # 冷却检查
     last_buy = g.last_buy_time.get(code, None)
     if last_buy is not None:
@@ -410,9 +588,9 @@ def _process_single_etf(context, code, now):
 
     if _should_log:
         g.last_log_time[code] = now
-        log.info('[买入观察] %s | 价:%s%.3f | VWAP:%.3f(%+.2f%%) | 涨跌:%+.2f%% | 振幅:%.2f%% | %s(短:%.2f/日:%.2f)' % (
+        log.info('[买入观察] %s | 价:%s%.3f | VWAP:%.3f(%+.2f%%) | 涨跌:%+.2f%% | 振幅:%.2f%% | %s | 换手:%.2f%% | 外/内:%.2f' % (
             name, price_dir, current_price, vwap, vwap_pct,
-            open_pct, intraday_range * 100, vol_tag, short_r, day_r))
+            open_pct, intraday_range * 100, vol_tag, turnover, in_out_r))
 
     # 条件3：企稳确认 — 不再继续下跌
     if prev_price > 0 and current_price < prev_price:
@@ -420,14 +598,13 @@ def _process_single_etf(context, code, now):
             log.info('[买入等待] %s 价格还在跌(%.3f→%.3f)，等企稳' % (name, prev_price, current_price))
         return
 
-    # 条件4：缩量确认 — 卖盘枯竭才接
+    # 条件4：量能确认 — PTrade原生量比+内外盘综合判断
     if vol_status == 'expanding':
         if _should_log:
-            log.info('[买入拒绝] %s 放量下跌！卖盘还很猛，不接刀 (短:%.2f/日:%.2f)' % (name, short_r, day_r))
+            log.info('[买入拒绝] %s 放量下跌！%s' % (name, vol_tag))
         return
     elif vol_status == 'shrinking':
-        # 缩量信号重要，无论限频都要打
-        log.info('[买入信号] %s 缩量下跌！卖盘枯竭，准备买入 (短:%.2f/日:%.2f)' % (name, short_r, day_r))
+        log.info('[买入信号] %s 缩量下跌 + 外盘不弱！卖盘枯竭 | %s' % (name, vol_tag))
 
     # 条件5：当日有过上涨（high > open），说明有弹性
     if open_px > 0 and high_px <= open_px:
@@ -473,9 +650,7 @@ def _print_monitor_panel(context, now):
             vwap_pct = (px / vwap - 1) * 100
             open_pct = (px / open_px - 1) * 100 if open_px > 0 else 0
             amp = (high_px - low_px) / low_px * 100 if low_px > 0 else 0
-            vol_st = _check_volume_shrink(code)
-            short_r, day_r = _get_volume_ratio(code)
-            vol_tag = {'shrinking': '缩量', 'expanding': '放量', 'neutral': '--'}.get(vol_st, '--')
+            vi = _analyze_volume(snap)
 
             # 判断当前状态
             holding = g.today_positions.get(code, 0)
@@ -489,54 +664,108 @@ def _print_monitor_panel(context, now):
                 status = '观望'
 
             name = _etf_name(code)
-            # 限制名称长度
             if len(name) > 8:
                 name = name[:8]
-            log.info('│ %s | %.3f | VWAP:%+.2f%% | 涨跌:%+.2f%% | 振幅:%.1f%% | %s(短%.1f/日%.1f) | %s' % (
-                name, px, vwap_pct, open_pct, amp, vol_tag, short_r, day_r, status))
+            log.info('│ %s | %.3f | VWAP:%+.2f%% | 涨跌:%+.2f%% | 振幅:%.1f%% | 量比:%.2f | 换手:%.2f%% | 外/内:%.2f | %s' % (
+                name, px, vwap_pct, open_pct, amp,
+                vi['vol_ratio'], vi['turnover'], vi['in_out_ratio'], status))
         except Exception:
             pass
 
-    log.info('│ 今日交易: %d/%d | 现金: %.0f' % (
-        g.today_trades, g.max_trades_per_day, context.portfolio.cash))
+    mkt_status = '暂停买入' if g.market_paused else '正常'
+    log.info('│ 今日交易: %d/%d | 现金: %.0f | 大盘: %s' % (
+        g.today_trades, g.max_trades_per_day, context.portfolio.cash, mkt_status))
     log.info('└──────────────────────────────────────────────┘')
 
 
 # ─────────────────────────────────────────────────────────────
-# 量能分析：缩量/放量判断
+# 量能分析（使用PTrade原生snapshot字段）
 # ─────────────────────────────────────────────────────────────
 #
-# 判断思路（双重对比，避免潮汐效应误判）：
+# PTrade snapshot 直接提供：
+#   vol_ratio      — 量比（当前成交量 vs 近5日同时段均量）
+#   turnover_ratio — 换手率
+#   business_amount_in  — 内盘量（主动卖出）
+#   business_amount_out — 外盘量（主动买入）
+#   business_balance    — 当日总成交额
 #
-#   1) 短期量比：最近N分钟均量 vs 前N分钟均量
-#      → 反映"趋势"：量在缩还是在放
-#
-#   2) 全日量比：最近N分钟均量 vs 当日每分钟平均量
-#      → 反映"绝对水平"：当前是偏高还是偏低
-#
-#   两个都说"缩量" → 真缩量，可以买
-#   任一个说"放量" → 放量下跌，别接
+# 判断思路：
+#   量比 + 换手率 + 内外盘比 三维度综合判断
+#   量比<0.8 + 外盘>内盘 = 缩量但有人在买 → 好买点
+#   量比>1.5 + 内盘>外盘 = 放量在抛 → 别碰
 # ─────────────────────────────────────────────────────────────
 
-def _calc_minute_vols(code):
-    """从累计成交量历史中提取每分钟增量"""
+def _analyze_volume(snap):
+    """从snapshot原生字段分析量能状态
+
+    参数: snap — get_snapshot()返回的单只ETF快照dict
+    返回: dict {
+        'status': 'shrinking'/'expanding'/'neutral',
+        'vol_ratio': 量比,
+        'turnover': 换手率,
+        'in_out_ratio': 外盘/内盘比（>1=买方主导，<1=卖方主导）,
+        'tag': 中文标签
+    }
+    """
+    vol_ratio = snap.get('vol_ratio', 1.0)
+    turnover = snap.get('turnover_ratio', 0)
+    inner = snap.get('business_amount_in', 0)   # 内盘（主动卖）
+    outer = snap.get('business_amount_out', 0)   # 外盘（主动买）
+
+    # 内外盘比：外盘/内盘，>1说明买方更积极
+    if inner > 0:
+        in_out_ratio = outer / inner
+    else:
+        in_out_ratio = 1.0
+
+    # ── 综合判断 ──
+    status = 'neutral'
+    tag = '--'
+
+    if vol_ratio < 0.8:
+        # 量比低于0.8 = 成交量比近5日同时段明显缩小
+        if in_out_ratio >= 0.9:
+            # 缩量但外盘不弱（有人在悄悄接）→ 卖盘枯竭
+            status = 'shrinking'
+            tag = '缩量(量比%.2f/外内比%.2f)' % (vol_ratio, in_out_ratio)
+        else:
+            # 缩量且外盘也弱 → 没人买也没人卖，流动性差
+            status = 'neutral'
+            tag = '地量(量比%.2f)' % vol_ratio
+    elif vol_ratio > 1.5:
+        if in_out_ratio < 1.0:
+            # 放量 + 内盘大于外盘 = 放量抛售
+            status = 'expanding'
+            tag = '放量卖(量比%.2f/外内比%.2f)' % (vol_ratio, in_out_ratio)
+        else:
+            # 放量 + 外盘大于内盘 = 放量买入（有后劲）
+            status = 'expanding_buy'
+            tag = '放量买(量比%.2f/外内比%.2f)' % (vol_ratio, in_out_ratio)
+    else:
+        tag = '正常(量比%.2f)' % vol_ratio
+
+    return {
+        'status': status,
+        'vol_ratio': vol_ratio,
+        'turnover': turnover,
+        'in_out_ratio': in_out_ratio,
+        'tag': tag
+    }
+
+
+def _check_volume_shrink(code):
+    """兼容旧接口：返回 'shrinking'/'expanding'/'neutral'
+    用于大盘等没有完整snap的场景，fallback到分钟量对比
+    """
     history = g.volume_history.get(code, [])
-    if len(history) < 2:
-        return []
+    n = g.vol_lookback
+    if len(history) < 2 * n + 1:
+        return 'neutral'
+
     minute_vols = []
     for i in range(1, len(history)):
         delta = history[i][0] - history[i - 1][0]
         minute_vols.append(max(delta, 0))
-    return minute_vols
-
-
-def _check_volume_shrink(code):
-    """判断当前是缩量还是放量
-
-    返回: 'shrinking'=缩量, 'expanding'=放量, 'neutral'=数据不足/持平
-    """
-    minute_vols = _calc_minute_vols(code)
-    n = g.vol_lookback
 
     if len(minute_vols) < 2 * n:
         return 'neutral'
@@ -544,44 +773,15 @@ def _check_volume_shrink(code):
     recent_avg = sum(minute_vols[-n:]) / n
     earlier_avg = sum(minute_vols[-2 * n:-n]) / n
 
-    # ── 短期量比：近N分钟 vs 前N分钟 ──
-    if earlier_avg > 0:
-        short_ratio = recent_avg / earlier_avg
-    else:
-        short_ratio = 1.0
+    if earlier_avg <= 0:
+        return 'neutral'
 
-    # ── 全日量比：近N分钟 vs 当日每分钟平均 ──
-    all_avg = sum(minute_vols) / len(minute_vols) if minute_vols else 0
-    if all_avg > 0:
-        day_ratio = recent_avg / all_avg
-    else:
-        day_ratio = 1.0
-
-    # 判断逻辑：
-    # 放量 = 任一维度显著高于正常（短期>1.3 或 全日>1.5）
-    # 缩量 = 两个维度都偏低（短期<0.7 且 全日<0.85）
-    if short_ratio >= 1.3 or day_ratio >= 1.5:
+    ratio = recent_avg / earlier_avg
+    if ratio >= 1.3:
         return 'expanding'
-    elif short_ratio <= g.vol_shrink_ratio and day_ratio <= 0.85:
+    elif ratio <= 0.7:
         return 'shrinking'
-    else:
-        return 'neutral'
-
-
-def _get_volume_ratio(code):
-    """获取量比数值（短期/全日），用于日志"""
-    minute_vols = _calc_minute_vols(code)
-    n = g.vol_lookback
-    if len(minute_vols) < 2 * n:
-        return 0, 0
-
-    recent_avg = sum(minute_vols[-n:]) / n
-    earlier_avg = sum(minute_vols[-2 * n:-n]) / n
-    all_avg = sum(minute_vols) / len(minute_vols) if minute_vols else 0
-
-    short_r = recent_avg / earlier_avg if earlier_avg > 0 else 0
-    day_r = recent_avg / all_avg if all_avg > 0 else 0
-    return short_r, day_r
+    return 'neutral'
 
 
 # ─────────────────────────────────────────────────────────────
@@ -603,11 +803,9 @@ def _do_buy(context, code, price, vwap, now, vol_status='neutral'):
         g.today_trades += 1
         g.last_buy_time[code] = now
         g.today_sold_stage[code] = set()
-        short_r, day_r = _get_volume_ratio(code)
-        vol_tag = '缩量' if vol_status == 'shrinking' else ('放量' if vol_status == 'expanding' else '正常')
-        log.info('[买入] %s(%s) | 价:%.3f | VWAP:%.3f | 偏离:%.2f%% | 量:%d | 短期量比:%.2f 全日量比:%.2f(%s) | 费:%.1f' % (
+        log.info('[买入] %s(%s) | 价:%.3f | VWAP:%.3f | 偏离:%.2f%% | 量:%d | 费:%.1f | %s' % (
             _etf_name(code), code, price, vwap,
-            (price / vwap - 1) * 100, buy_amount, short_r, day_r, vol_tag, commission))
+            (price / vwap - 1) * 100, buy_amount, commission, vol_status))
 
 
 def _do_sell(context, code, amount, price, reason):
@@ -698,7 +896,7 @@ def _round_lot(amount):
 
 def _print_daily_summary(context):
     log.info('═══════════════════════════════════════════════')
-    log.info('  ETF T+0 做T策略 V2 - 今日汇总')
+    log.info('  ETF T+0 做T策略 V3 - 今日汇总')
     log.info('─────────────────────────────────────────────')
     log.info('  交易次数: %d / %d' % (g.today_trades, g.max_trades_per_day))
     log.info('  趋势屏蔽: %s' % (
