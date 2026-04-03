@@ -111,7 +111,9 @@ def _create_default_config():
         "日内波动率最低要求(%)": 1.0,
         "清仓时间": "14:55",
         "开始交易时间": "09:50",
-        "买入冷却分钟数": 15
+        "买入冷却分钟数": 15,
+        "缩量判断比例": 0.7,
+        "量能对比分钟数": 5
     }
     _save_json('etf_t0_config.json', config)
     log.info('[配置] 已创建默认配置文件 etf_t0_config.json')
@@ -171,6 +173,9 @@ def initialize(context):
     g.today_positions = {}     # {code: 持仓数量}
     g.trend_blocked = set()
     g.prev_prices = {}         # {code: 上一分钟价格} 用于判断企稳
+    g.volume_history = {}      # {code: [(cumulative_vol, price), ...]} 每分钟快照
+    g.vol_shrink_ratio = config.get("缩量判断比例", 0.7)  # 近期量/前期量 < 0.7 = 缩量
+    g.vol_lookback = config.get("量能对比分钟数", 5)       # 对比最近5分钟 vs 前5分钟
 
     # ── 定时任务 ──
     run_daily(context, _reset_daily_state, time='09:25')
@@ -193,6 +198,7 @@ def initialize(context):
         g.sell_target_1 * 100, g.sell_target_2 * 100, g.sell_target_3 * 100))
     log.info('  止损: -%.1f%% (快止损)' % (g.stop_loss_pct * 100))
     log.info('  仓位: 总≤%.0f%% 单≤%.0f%%' % (g.max_position * 100, g.max_single_position * 100))
+    log.info('  量能: 缩量比≤%.0f%% 才买入(对比%d分钟窗口)' % (g.vol_shrink_ratio * 100, g.vol_lookback))
     log.info('  交易窗口: %s ~ %s' % (g.start_trade_time, g.clear_time))
     log.info('═══════════════════════════════════════════════')
 
@@ -209,6 +215,7 @@ def _reset_daily_state(context):
     g.today_positions = {}
     g.trend_blocked = set()
     g.prev_prices = {}
+    g.volume_history = {}
     log.info('[日内重置] 状态已清空')
 
     for code in g.etf_pool:
@@ -274,10 +281,18 @@ def _process_single_etf(context, code, now):
     high_px = snap.get('high_px', 0)
     low_px = snap.get('low_px', 0)
     open_px = snap.get('open_px', 0)
-    volume = snap.get('business_amount', 0)  # 成交量
 
     if current_price <= 0 or vwap <= 0:
         return
+
+    # ── 每分钟记录累计成交量，用于缩放量判断 ──
+    cum_vol = snap.get('business_amount', 0)  # 当日累计成交量
+    if code not in g.volume_history:
+        g.volume_history[code] = []
+    g.volume_history[code].append((cum_vol, current_price))
+    # 只保留最近20分钟数据，节省内存
+    if len(g.volume_history[code]) > 20:
+        g.volume_history[code] = g.volume_history[code][-20:]
 
     today_holding = g.today_positions.get(code, 0)
 
@@ -345,7 +360,6 @@ def _process_single_etf(context, code, now):
     # 条件2：当前价 ≤ VWAP × (1 - buy_dip_pct)
     buy_threshold = vwap * (1 - g.buy_dip_pct)
     if current_price > buy_threshold:
-        # 记录价格供下次比较
         g.prev_prices[code] = current_price
         return
 
@@ -353,10 +367,16 @@ def _process_single_etf(context, code, now):
     prev_price = g.prev_prices.get(code, 0)
     g.prev_prices[code] = current_price
     if prev_price > 0 and current_price < prev_price:
-        # 还在跌，不急着接，等止跌
+        return  # 还在跌，等止跌
+
+    # 条件4：缩量确认 — 下跌时成交量在萎缩，说明卖盘枯竭
+    vol_status = _check_volume_shrink(code)
+    if vol_status == 'expanding':
+        # 放量下跌，卖盘还很猛，不买
+        log.info('[量能过滤] %s(%s) 放量下跌中，暂不买入' % (_etf_name(code), code))
         return
 
-    # 条件4：当日有过上涨（high > open），说明有弹性
+    # 条件5：当日有过上涨（high > open），说明有弹性
     if open_px > 0 and high_px <= open_px:
         return
 
@@ -364,14 +384,84 @@ def _process_single_etf(context, code, now):
     if not _check_position_limit(context, code):
         return
 
-    _do_buy(context, code, current_price, vwap, now)
+    _do_buy(context, code, current_price, vwap, now, vol_status)
+
+
+# ─────────────────────────────────────────────────────────────
+# 量能分析：缩量/放量判断
+# ─────────────────────────────────────────────────────────────
+
+def _check_volume_shrink(code):
+    """判断当前是缩量还是放量下跌
+
+    原理：比较最近N分钟的每分钟成交量 vs 之前N分钟的每分钟成交量
+    - 累计成交量每分钟在增加，差值 = 该分钟的增量成交量
+    - 近期增量 < 前期增量 × shrink_ratio → 缩量（卖盘枯竭，可以买）
+    - 近期增量 > 前期增量 → 放量（卖盘凶猛，别接）
+
+    返回: 'shrinking'=缩量, 'expanding'=放量, 'neutral'=数据不足/持平
+    """
+    history = g.volume_history.get(code, [])
+    n = g.vol_lookback  # 对比窗口（默认5分钟）
+
+    # 至少需要 2*N+1 个数据点才能对比两段
+    if len(history) < 2 * n + 1:
+        return 'neutral'  # 数据不足，不过滤
+
+    # 计算每分钟增量成交量
+    minute_vols = []
+    for i in range(1, len(history)):
+        delta = history[i][0] - history[i - 1][0]
+        minute_vols.append(max(delta, 0))
+
+    if len(minute_vols) < 2 * n:
+        return 'neutral'
+
+    # 最近N分钟的平均增量
+    recent_avg = sum(minute_vols[-n:]) / n
+    # 前N分钟的平均增量
+    earlier_avg = sum(minute_vols[-2 * n:-n]) / n
+
+    if earlier_avg <= 0:
+        return 'neutral'
+
+    ratio = recent_avg / earlier_avg
+
+    if ratio <= g.vol_shrink_ratio:
+        # 缩量：最近的量明显小于前期 → 卖盘衰竭
+        return 'shrinking'
+    elif ratio >= 1.3:
+        # 放量：最近的量明显大于前期 → 卖盘加速
+        return 'expanding'
+    else:
+        return 'neutral'
+
+
+def _get_volume_ratio(code):
+    """获取量比数值，用于日志"""
+    history = g.volume_history.get(code, [])
+    n = g.vol_lookback
+    if len(history) < 2 * n + 1:
+        return 0
+
+    minute_vols = []
+    for i in range(1, len(history)):
+        delta = history[i][0] - history[i - 1][0]
+        minute_vols.append(max(delta, 0))
+
+    if len(minute_vols) < 2 * n:
+        return 0
+
+    recent_avg = sum(minute_vols[-n:]) / n
+    earlier_avg = sum(minute_vols[-2 * n:-n]) / n
+    return recent_avg / earlier_avg if earlier_avg > 0 else 0
 
 
 # ─────────────────────────────────────────────────────────────
 # 买卖执行
 # ─────────────────────────────────────────────────────────────
 
-def _do_buy(context, code, price, vwap, now):
+def _do_buy(context, code, price, vwap, now, vol_status='neutral'):
     total_value = context.portfolio.total_value
     buy_value = total_value * g.max_single_position
     buy_amount = _round_lot(int(buy_value / price))
@@ -386,9 +476,11 @@ def _do_buy(context, code, price, vwap, now):
         g.today_trades += 1
         g.last_buy_time[code] = now
         g.today_sold_stage[code] = set()
-        log.info('[买入] %s(%s) | 价:%.3f | VWAP:%.3f | 偏离:%.2f%% | 量:%d | 费:%.1f' % (
+        vol_ratio = _get_volume_ratio(code)
+        vol_tag = '缩量' if vol_status == 'shrinking' else ('放量' if vol_status == 'expanding' else '正常')
+        log.info('[买入] %s(%s) | 价:%.3f | VWAP:%.3f | 偏离:%.2f%% | 量:%d | 量比:%.2f(%s) | 费:%.1f' % (
             _etf_name(code), code, price, vwap,
-            (price / vwap - 1) * 100, buy_amount, commission))
+            (price / vwap - 1) * 100, buy_amount, vol_ratio, vol_tag, commission))
 
 
 def _do_sell(context, code, amount, price, reason):
