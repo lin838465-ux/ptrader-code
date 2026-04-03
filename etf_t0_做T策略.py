@@ -290,9 +290,9 @@ def _process_single_etf(context, code, now):
     if code not in g.volume_history:
         g.volume_history[code] = []
     g.volume_history[code].append((cum_vol, current_price))
-    # 只保留最近20分钟数据，节省内存
-    if len(g.volume_history[code]) > 20:
-        g.volume_history[code] = g.volume_history[code][-20:]
+    # 保留全天数据（09:50~14:55 约300分钟），用于全日量比计算
+    if len(g.volume_history[code]) > 310:
+        g.volume_history[code] = g.volume_history[code][-310:]
 
     today_holding = g.today_positions.get(code, 0)
 
@@ -390,71 +390,83 @@ def _process_single_etf(context, code, now):
 # ─────────────────────────────────────────────────────────────
 # 量能分析：缩量/放量判断
 # ─────────────────────────────────────────────────────────────
+#
+# 判断思路（双重对比，避免潮汐效应误判）：
+#
+#   1) 短期量比：最近N分钟均量 vs 前N分钟均量
+#      → 反映"趋势"：量在缩还是在放
+#
+#   2) 全日量比：最近N分钟均量 vs 当日每分钟平均量
+#      → 反映"绝对水平"：当前是偏高还是偏低
+#
+#   两个都说"缩量" → 真缩量，可以买
+#   任一个说"放量" → 放量下跌，别接
+# ─────────────────────────────────────────────────────────────
 
-def _check_volume_shrink(code):
-    """判断当前是缩量还是放量下跌
-
-    原理：比较最近N分钟的每分钟成交量 vs 之前N分钟的每分钟成交量
-    - 累计成交量每分钟在增加，差值 = 该分钟的增量成交量
-    - 近期增量 < 前期增量 × shrink_ratio → 缩量（卖盘枯竭，可以买）
-    - 近期增量 > 前期增量 → 放量（卖盘凶猛，别接）
-
-    返回: 'shrinking'=缩量, 'expanding'=放量, 'neutral'=数据不足/持平
-    """
+def _calc_minute_vols(code):
+    """从累计成交量历史中提取每分钟增量"""
     history = g.volume_history.get(code, [])
-    n = g.vol_lookback  # 对比窗口（默认5分钟）
-
-    # 至少需要 2*N+1 个数据点才能对比两段
-    if len(history) < 2 * n + 1:
-        return 'neutral'  # 数据不足，不过滤
-
-    # 计算每分钟增量成交量
+    if len(history) < 2:
+        return []
     minute_vols = []
     for i in range(1, len(history)):
         delta = history[i][0] - history[i - 1][0]
         minute_vols.append(max(delta, 0))
+    return minute_vols
+
+
+def _check_volume_shrink(code):
+    """判断当前是缩量还是放量
+
+    返回: 'shrinking'=缩量, 'expanding'=放量, 'neutral'=数据不足/持平
+    """
+    minute_vols = _calc_minute_vols(code)
+    n = g.vol_lookback
 
     if len(minute_vols) < 2 * n:
         return 'neutral'
 
-    # 最近N分钟的平均增量
     recent_avg = sum(minute_vols[-n:]) / n
-    # 前N分钟的平均增量
     earlier_avg = sum(minute_vols[-2 * n:-n]) / n
 
-    if earlier_avg <= 0:
-        return 'neutral'
+    # ── 短期量比：近N分钟 vs 前N分钟 ──
+    if earlier_avg > 0:
+        short_ratio = recent_avg / earlier_avg
+    else:
+        short_ratio = 1.0
 
-    ratio = recent_avg / earlier_avg
+    # ── 全日量比：近N分钟 vs 当日每分钟平均 ──
+    all_avg = sum(minute_vols) / len(minute_vols) if minute_vols else 0
+    if all_avg > 0:
+        day_ratio = recent_avg / all_avg
+    else:
+        day_ratio = 1.0
 
-    if ratio <= g.vol_shrink_ratio:
-        # 缩量：最近的量明显小于前期 → 卖盘衰竭
-        return 'shrinking'
-    elif ratio >= 1.3:
-        # 放量：最近的量明显大于前期 → 卖盘加速
+    # 判断逻辑：
+    # 放量 = 任一维度显著高于正常（短期>1.3 或 全日>1.5）
+    # 缩量 = 两个维度都偏低（短期<0.7 且 全日<0.85）
+    if short_ratio >= 1.3 or day_ratio >= 1.5:
         return 'expanding'
+    elif short_ratio <= g.vol_shrink_ratio and day_ratio <= 0.85:
+        return 'shrinking'
     else:
         return 'neutral'
 
 
 def _get_volume_ratio(code):
-    """获取量比数值，用于日志"""
-    history = g.volume_history.get(code, [])
+    """获取量比数值（短期/全日），用于日志"""
+    minute_vols = _calc_minute_vols(code)
     n = g.vol_lookback
-    if len(history) < 2 * n + 1:
-        return 0
-
-    minute_vols = []
-    for i in range(1, len(history)):
-        delta = history[i][0] - history[i - 1][0]
-        minute_vols.append(max(delta, 0))
-
     if len(minute_vols) < 2 * n:
-        return 0
+        return 0, 0
 
     recent_avg = sum(minute_vols[-n:]) / n
     earlier_avg = sum(minute_vols[-2 * n:-n]) / n
-    return recent_avg / earlier_avg if earlier_avg > 0 else 0
+    all_avg = sum(minute_vols) / len(minute_vols) if minute_vols else 0
+
+    short_r = recent_avg / earlier_avg if earlier_avg > 0 else 0
+    day_r = recent_avg / all_avg if all_avg > 0 else 0
+    return short_r, day_r
 
 
 # ─────────────────────────────────────────────────────────────
@@ -476,11 +488,11 @@ def _do_buy(context, code, price, vwap, now, vol_status='neutral'):
         g.today_trades += 1
         g.last_buy_time[code] = now
         g.today_sold_stage[code] = set()
-        vol_ratio = _get_volume_ratio(code)
+        short_r, day_r = _get_volume_ratio(code)
         vol_tag = '缩量' if vol_status == 'shrinking' else ('放量' if vol_status == 'expanding' else '正常')
-        log.info('[买入] %s(%s) | 价:%.3f | VWAP:%.3f | 偏离:%.2f%% | 量:%d | 量比:%.2f(%s) | 费:%.1f' % (
+        log.info('[买入] %s(%s) | 价:%.3f | VWAP:%.3f | 偏离:%.2f%% | 量:%d | 短期量比:%.2f 全日量比:%.2f(%s) | 费:%.1f' % (
             _etf_name(code), code, price, vwap,
-            (price / vwap - 1) * 100, buy_amount, vol_ratio, vol_tag, commission))
+            (price / vwap - 1) * 100, buy_amount, short_r, day_r, vol_tag, commission))
 
 
 def _do_sell(context, code, amount, price, reason):
