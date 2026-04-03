@@ -280,18 +280,9 @@ def _get_current_price(context, code):
         except Exception:
             return None
     else:
-        # 回测模式：用1分钟线获取当前价格，确保分钟级扫描能拿到实时价格
+        # 回测模式：必须用1分钟线获取当前价格，拿不到就跳过，绝不回退日线
         try:
             raw = get_history(1, '1m', 'close', code, fq='pre', include=True, is_dict=True)
-            if raw:
-                cl = _extract_close_list(raw, code)
-                if cl and len(cl) > 0:
-                    return float(cl[-1])
-        except Exception:
-            pass
-        # 分钟线取不到时回退日线
-        try:
-            raw = get_history(2, '1d', 'close', code, fq='pre', include=True, is_dict=True)
             if raw:
                 cl = _extract_close_list(raw, code)
                 if cl and len(cl) > 0:
