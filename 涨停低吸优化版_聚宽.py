@@ -25,11 +25,14 @@ CONF = {
     '每日买入只数': 1,           # 每天最多买几只，建议1
     '止盈比例': 0.05,            # 盘中达到就卖，默认+5%
     '止损比例': 0.05,            # 14:55检查，达到才卖，默认-5%
+    '盘中硬止损': 0.03,          # 盘中跌超3%立即割，不等14:55（防暴跌）
     '最长持仓天数': 7,           # 超过N天强制平仓
     '低开下限': -0.09,           # 低开太多不买（-9%）
     '低开上限': 0.003,           # 高开不买（+0.3%以内可以）
     '理想低开': -0.012,          # 打分基准：低开-1.2%最佳
     '要求昨日回调': True,        # 昨天必须是阴线或下跌
+    '昨日最大跌幅': -0.04,       # 昨天跌超4%不买（跌太多的第二天往往继续跌）
+    '连亏暂停天数': 2,           # 连续亏损后暂停N天不买
     '偏好大市值': True,          # 大市值加分
     '主板池上限': 1500,          # 流通市值前N只
 }
@@ -52,15 +55,23 @@ def initialize(context):
     g.prefer_large_cap = CONF['偏好大市值']
     g.max_pool = CONF['主板池上限']
 
+    g.intraday_sl = CONF['盘中硬止损']
+    g.max_yesterday_drop = CONF['昨日最大跌幅']
+    g.pause_after_loss = CONF['连亏暂停天数']
+
     g.hold_days = {}
     g.today_bought = 0
+    g.consecutive_losses = 0     # 连续亏损次数
+    g.pause_until = None         # 暂停买入直到这个日期
 
     run_daily(execute_buy, time='09:30')
     run_daily(check_stop_loss, time='14:55')
 
-    log.info('涨停低吸优化版 初始化完成')
-    log.info('止盈: +%.1f%% | 止损: -%.1f%%(14:55) | 持仓上限: %d天' % (
-        g.tp_ratio * 100, g.sl_ratio * 100, g.max_hold_days))
+    log.info('涨停低吸优化版 V2 初始化完成')
+    log.info('止盈: +%.1f%% | 止损: -%.1f%%(14:55) | 盘中硬止损: -%.1f%%' % (
+        g.tp_ratio * 100, g.sl_ratio * 100, g.intraday_sl * 100))
+    log.info('昨跌上限: %.1f%% | 连亏暂停: %d天 | 持仓上限: %d天' % (
+        g.max_yesterday_drop * 100, g.pause_after_loss, g.max_hold_days))
 
 
 def before_trading_start(context):
@@ -80,7 +91,7 @@ def before_trading_start(context):
 # ─────────────────────────────────────────────────────────────
 
 def handle_data(context, data):
-    """盘中止盈：达到+N%立即卖"""
+    """盘中：止盈 + 硬止损"""
     curr_data = get_current_data()
     positions = context.portfolio.positions
 
@@ -95,14 +106,32 @@ def handle_data(context, data):
             continue
 
         ret = curr_price / cost - 1
+
+        # 盘中止盈：+5%
         if ret >= g.tp_ratio:
             order_target_value(stock, 0)
             days = g.hold_days.get(stock, 0)
+            name = get_security_info(stock).display_name
             log.info('[盘中止盈] %s %s | 成本:%.2f | 现价:%.2f | +%.2f%% | 持%d天' % (
-                stock, get_security_info(stock).display_name,
-                cost, curr_price, ret * 100, days))
+                stock, name, cost, curr_price, ret * 100, days))
             if stock in g.hold_days:
                 del g.hold_days[stock]
+            g.consecutive_losses = 0  # 盈利重置连亏计数
+
+        # 盘中硬止损：-3%立即割（不等14:55，防暴跌扩大到-8%）
+        elif ret <= -g.intraday_sl:
+            order_target_value(stock, 0)
+            days = g.hold_days.get(stock, 0)
+            name = get_security_info(stock).display_name
+            log.info('[盘中硬止损] %s %s | 成本:%.2f | 现价:%.2f | %.2f%% | 持%d天' % (
+                stock, name, cost, curr_price, ret * 100, days))
+            if stock in g.hold_days:
+                del g.hold_days[stock]
+            g.consecutive_losses += 1
+            if g.consecutive_losses >= 2:
+                g.pause_until = context.current_dt.date() + dt.timedelta(days=g.pause_after_loss + 1)
+                log.info('[连亏暂停] 连续亏损%d次，暂停买入至%s' % (
+                    g.consecutive_losses, g.pause_until))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -117,6 +146,11 @@ def execute_buy(context):
     for stock, pos in context.portfolio.positions.items():
         if pos.total_amount > 0:
             return
+
+    # 连亏暂停检查
+    if g.pause_until and context.current_dt.date() <= g.pause_until:
+        log.info('[连亏暂停] 暂停中，%s恢复' % g.pause_until)
+        return
 
     # 大盘过滤
     if _is_market_crash(context):
@@ -180,6 +214,11 @@ def check_stop_loss(context):
             log.info('[14:55止损] %s %s | %.2f%% | 持%d天' % (stock, name, ret * 100, hold))
             if stock in g.hold_days:
                 del g.hold_days[stock]
+            g.consecutive_losses += 1
+            if g.consecutive_losses >= 2:
+                g.pause_until = context.current_dt.date() + dt.timedelta(days=g.pause_after_loss + 1)
+                log.info('[连亏暂停] 连续亏损%d次，暂停买入至%s' % (
+                    g.consecutive_losses, g.pause_until))
 
         elif hold >= g.max_hold_days:
             order_target_value(stock, 0)
@@ -242,10 +281,13 @@ def _get_candidates(context):
             continue
         days_since_limit = abs(latest_limit_idx + 1)
 
-        # ── 条件2：昨日回调 ──
+        # ── 条件2：昨日回调（但不能跌太多）──
         y_ret = y_close / prev_close - 1
         is_pullback = (y_close < y_open) or (y_close < prev_close)
         if g.require_pullback and not is_pullback:
+            continue
+        # 昨天跌超4%的不买（天娱数科-5.53%、文投控股-5.36%这种买了就亏）
+        if y_ret < g.max_yesterday_drop:
             continue
 
         # ── 条件3：今日低开 ──
