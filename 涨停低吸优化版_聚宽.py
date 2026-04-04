@@ -85,15 +85,55 @@ def before_trading_start(context):
         else:
             g.hold_days[stock] += 1
 
+    # 盘前检查：持仓股今日开盘价是否已跳空亏损超3%
+    curr_data = get_current_data()
+    for stock in list(g.hold_days.keys()):
+        if stock not in positions or positions[stock].total_amount == 0:
+            continue
+        cost = positions[stock].avg_cost
+        if cost <= 0:
+            continue
+        try:
+            open_px = curr_data[stock].day_open
+            if open_px > 0:
+                open_ret = open_px / cost - 1
+                if open_ret <= -g.intraday_sl:
+                    g.gap_down_stocks = getattr(g, 'gap_down_stocks', set())
+                    g.gap_down_stocks.add(stock)
+                    log.info('[盘前预警] %s 开盘跳空%.2f%%，第一分钟立即割' % (stock, open_ret * 100))
+        except Exception:
+            pass
+
 
 # ─────────────────────────────────────────────────────────────
 # 盘中：每分钟止盈检查
 # ─────────────────────────────────────────────────────────────
 
 def handle_data(context, data):
-    """盘中：止盈 + 硬止损"""
+    """盘中：跳空立割 + 止盈 + 硬止损"""
     curr_data = get_current_data()
     positions = context.portfolio.positions
+
+    # 跳空跌的票第一时间割（抚顺特钢-8.56%那种）
+    gap_down = getattr(g, 'gap_down_stocks', set())
+    if gap_down:
+        for stock in list(gap_down):
+            if stock in positions and positions[stock].closeable_amount > 0:
+                cost = positions[stock].avg_cost
+                px = curr_data[stock].last_price
+                ret = px / cost - 1 if cost > 0 else 0
+                order_target_value(stock, 0)
+                days = g.hold_days.get(stock, 0)
+                name = get_security_info(stock).display_name
+                log.info('[跳空止损] %s %s | 成本:%.2f | 现价:%.2f | %.2f%% | 持%d天' % (
+                    stock, name, cost, px, ret * 100, days))
+                if stock in g.hold_days:
+                    del g.hold_days[stock]
+                g.consecutive_losses += 1
+                if g.consecutive_losses >= 2:
+                    g.pause_until = context.current_dt.date() + dt.timedelta(days=g.pause_after_loss + 1)
+                    log.info('[连亏暂停] 连续亏损%d次，暂停买入至%s' % (g.consecutive_losses, g.pause_until))
+        g.gap_down_stocks = set()
 
     for stock in list(positions.keys()):
         pos = positions[stock]
@@ -311,14 +351,6 @@ def _get_candidates(context):
                 continue
         except Exception:
             pass
-
-        # ── 条件5：昨日振幅不能太大（振幅>8%的票波动太剧烈，容易跳空）──
-        y_high = float(sub['high'].iloc[-1]) if 'high' in sub.columns else y_close
-        y_low = float(sub['low'].iloc[-1]) if 'low' in sub.columns else y_close
-        if y_low > 0:
-            y_amplitude = (y_high - y_low) / y_low
-            if y_amplitude > 0.08:
-                continue
 
         # ── 打分（越低越好）──
         gap_penalty = abs(open_gap - g.target_open_gap) * 100
