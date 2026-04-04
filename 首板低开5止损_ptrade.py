@@ -327,7 +327,7 @@ def buy(context):
                 continue
         else:
             try:
-                raw = get_history(1, '1d', 'close', code, fq=None, include=False)
+                raw = get_history(1, '1d', 'close', code, fq='pre', include=True, is_dict=True)
                 if raw is None or len(raw) == 0:
                     continue
                 close_list = raw.get(code)
