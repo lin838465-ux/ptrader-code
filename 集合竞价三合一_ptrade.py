@@ -263,8 +263,7 @@ def _get_hl_stock(initial_list, date):
     if not initial_list:
         return []
     df = get_price(initial_list, end_date=date, count=1,
-                   fields=['close', 'high_limit'],
-                   panel=False).dropna()
+                   fields=['close', 'high_limit']).dropna()
     return list(df[df['close'] == df['high_limit']]['code'])
 
 
@@ -272,8 +271,7 @@ def _get_ever_hl_stock(initial_list, date):
     if not initial_list:
         return []
     df = get_price(initial_list, end_date=date, count=1,
-                   fields=['high', 'high_limit'],
-                   panel=False).dropna()
+                   fields=['high', 'high_limit']).dropna()
     return list(df[df['high'] == df['high_limit']]['code'])
 
 
@@ -281,8 +279,7 @@ def _get_ever_hl_stock2(initial_list, date):
     if not initial_list:
         return []
     df = get_price(initial_list, end_date=date, count=1,
-                   fields=['close', 'high', 'high_limit'],
-                   panel=False).dropna()
+                   fields=['close', 'high', 'high_limit']).dropna()
     mask = (df['high'] == df['high_limit']) & (df['close'] != df['high_limit'])
     return list(df[mask]['code'])
 
@@ -291,8 +288,7 @@ def _get_hl_count_df(hl_list, date, watch_days):
     if not hl_list:
         return __import__('pandas').DataFrame(columns=['count', 'extreme_count'])
     df = get_price(hl_list, end_date=date, count=watch_days,
-                   fields=['close', 'high_limit', 'low'],
-                   panel=False)
+                   fields=['close', 'high_limit', 'low'])
     hl_count, ex_count = [], []
     for stock in hl_list:
         sub = df[df['code'] == stock]
@@ -326,8 +322,7 @@ def _get_relative_position_df(stock_list, date, watch_days):
     if not stock_list:
         return __import__('pandas').DataFrame(columns=['rp'])
     df = get_price(stock_list, end_date=date, count=watch_days,
-                   fields=['high', 'low', 'close'],
-                   panel=False).dropna()
+                   fields=['high', 'low', 'close']).dropna()
     if df.empty:
         return __import__('pandas').DataFrame(columns=['rp'])
     close = df.groupby('code').apply(lambda x: x['close'].iloc[-1])
@@ -674,7 +669,7 @@ def buy(context):
                         continue
             else:
                 try:
-                    raw = get_history(1, '1d', 'close', s, fq=None, include=False)
+                    raw = get_history(1, '1d', 'close', s, fq='pre', include=False, is_dict=True)
                     if raw is None or len(raw) == 0:
                         continue
                     close_list = raw.get(s)

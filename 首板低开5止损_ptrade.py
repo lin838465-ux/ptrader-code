@@ -276,8 +276,7 @@ def buy(context):
         return
 
     df_pos = get_price(first_limit, end_date=yesterday, count=60,
-                       fields=['high', 'low', 'close'],
-                       panel=False).dropna()
+                       fields=['high', 'low', 'close']).dropna()
     rp = {}
     for code in first_limit:
         d = df_pos[df_pos['code'] == code]
