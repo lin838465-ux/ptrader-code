@@ -318,6 +318,28 @@ def buy(context):
     if not buy_list:
         return
 
+    # ── 大盘过滤：沪深300当日跌超1.5%不买 ──
+    try:
+        bench_raw = get_history(2, '1d', 'close', '000300.SS', fq='pre', include=True, is_dict=True)
+        bench_vals = None
+        if bench_raw:
+            for k in bench_raw:
+                bench_vals = bench_raw[k]
+                break
+        if bench_vals and len(bench_vals) >= 2:
+            bench_chg = (float(bench_vals[-1]) - float(bench_vals[-2])) / float(bench_vals[-2])
+            if bench_chg < -0.015:
+                log.info('[大盘过滤] 沪深300跌%.2f%%，今日不买' % (bench_chg * 100))
+                return
+    except Exception:
+        pass
+
+    # ── 排序：按60日相对位置从低到高，只买最优的1只 ──
+    MAX_BUY = 1
+    buy_list.sort(key=lambda c: rp.get(c, 1))
+    buy_list = buy_list[:MAX_BUY]
+    log.info('[选股] 最终买入: %s' % ','.join(buy_list))
+
     cash = context.portfolio.cash / len(buy_list)
     for code in buy_list:
         if is_trade():
@@ -423,7 +445,7 @@ def sell(context):
             log.info('[%s止损] 卖出：%s' % (name, code))
             continue
 
-        if t == '11:28:00' and now > cost and now < high_lmt:
+        if t == '11:28:00' and now > cost * 1.01 and now < high_lmt:  # 至少盈利1%才止盈
             pending = g.pending_order
             if pending.get('side') == 'sell' and _same_security(pending.get('code'), code):
                 continue

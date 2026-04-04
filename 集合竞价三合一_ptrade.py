@@ -636,13 +636,47 @@ def buy(context):
 
     if qualified_stocks:
         log.info('==================================================')
-        log.info('今日选股：' + ','.join(qualified_stocks))
+        log.info('今日全部候选：' + ','.join(qualified_stocks))
         log.info('一进二：' + ','.join(gk_stocks))
         log.info('首板低开：' + ','.join(dk_stocks))
         log.info('弱转强：' + ','.join(rzq_stocks))
         log.info('==================================================')
     else:
         log.info('今日无目标个股')
+
+    # ── 大盘过滤：沪深300当日跌超1.5%不买 ──
+    if qualified_stocks:
+        try:
+            bench_raw = get_history(2, '1d', 'close', '000300.SS', fq='pre', include=True, is_dict=True)
+            bench_vals = None
+            if bench_raw:
+                for k in bench_raw:
+                    bench_vals = bench_raw[k]
+                    break
+            if bench_vals and len(bench_vals) >= 2:
+                bench_chg = (float(bench_vals[-1]) - float(bench_vals[-2])) / float(bench_vals[-2])
+                if bench_chg < -0.015:
+                    log.info('[大盘过滤] 沪深300跌%.2f%%，今日不买' % (bench_chg * 100))
+                    qualified_stocks = []
+        except Exception:
+            pass
+
+    # ── 优先级排序：首板低开 > 一进二 > 弱转强，只买最优1-2只 ──
+    MAX_BUY = 2
+    if len(qualified_stocks) > MAX_BUY:
+        # 按子策略优先级排序
+        priority = {}
+        for s in dk_stocks:
+            priority[s] = 1  # 首板低开最稳
+        for s in gk_stocks:
+            if s not in priority:
+                priority[s] = 2  # 一进二其次
+        for s in rzq_stocks:
+            if s not in priority:
+                priority[s] = 3  # 弱转强最后
+        qualified_stocks.sort(key=lambda s: priority.get(s, 9))
+        qualified_stocks = qualified_stocks[:MAX_BUY]
+        log.info('[精选] 最终买入: %s' % ','.join(qualified_stocks))
 
     if (qualified_stocks and
             context.portfolio.cash / context.portfolio.total_value > 0.3):
@@ -749,12 +783,12 @@ def sell(context):
                 continue
 
             cost = float(getattr(pos, 'cost_basis', 0) or 0)
-            if now < high_lmt and now > cost:
+            if now < high_lmt and now > cost * 1.01:  # 至少盈利1%才止盈
                 name = g.code_name.get(s, s)
                 oid = _do_sell(s, sell_amount, now)
                 if oid is not None:
                     g.pending_order = {'code': s, 'side': 'sell', 'order_id': oid}
-                log.info('[止盈卖出] %s' % name)
+                log.info('[11:25止盈] %s 盈利%.2f%%' % (name, (now / cost - 1) * 100))
 
     elif t == '14:50:00':
         for s in hold:
