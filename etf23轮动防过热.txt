@@ -71,6 +71,7 @@ def _create_default_config():
     config = {
         "单次投入金额": 150000,
         "止损回撤比(%)": 5.0,
+        "买入准入均线要求(%)": 1.5,
         "当日跌幅卖出阈值(%)": -5.0,
         "主动换仓动量领先阈值(%)": 3.0,
         "买入防过热暴涨线(%)": 5.0
@@ -94,6 +95,7 @@ def _load_config():
     defaults = {
         "单次投入金额": 150000,
         "止损回撤比(%)": 5.0,
+        "买入准入均线要求(%)": 1.5,
         "当日跌幅卖出阈值(%)": -5.0,
         "主动换仓动量领先阈值(%)": 3.0,
         "买入防过热暴涨线(%)": 5.0
@@ -337,13 +339,7 @@ def _sync_holding_state(context):
     actual = None
     for code in positions:
         if positions[code].amount > 0 and _is_strategy_security(code):
-            # 映射回ETF池中的完整代码，保持格式统一
-            for pool_code in getattr(g, 'codes', []):
-                if _same_security(code, pool_code):
-                    actual = pool_code
-                    break
-            if actual is None:
-                actual = code
+            actual = code
             break
     g.current_holding = actual
     if actual is None:
@@ -455,8 +451,8 @@ def calc_realtime_ranking(context):
             log.error('[排名异常] %s: %s' % (code, str(e)))
 
     all_rankings.sort(key=lambda x: x['change20'], reverse=True)
-    # 正动量排名：20日和13日动量都为正才纳入
-    positive_rankings = [r for r in all_rankings if r['change20'] > 0 and r['change13'] > 0]
+    # 正动量排名：只保留20日动量>0的标的
+    positive_rankings = [r for r in all_rankings if r['change20'] > 0]
     return positive_rankings, all_rankings
 
 
@@ -799,6 +795,10 @@ def step_buy_1440(context):
             log.info('[14:50] %s 今日已卖出，跳过' % item['name'])
             skipped_count += 1
             continue
+        if item['change13'] <= g.buy_threshold:
+            log.info('[14:50] %s 小波段%.1f%% 未达准入%.1f%%' % (item['name'], item['change13'], g.buy_threshold))
+            skipped_count += 1
+            continue
             
         # 防过热：如果今天涨得太猛，放弃第一名，顺延下一位（买入防追高保护）
         today_change = _get_today_change(context, item['code'], item['price'])
@@ -887,6 +887,7 @@ def initialize(context):
     g.buy_period = 13
     g.max_strategy_capital = float(cfg.get('单次投入金额', 150000))
     g.trailing_stop_pct = float(cfg.get('止损回撤比(%)', 5.0))
+    g.buy_threshold = float(cfg.get('买入准入均线要求(%)', 1.5))
     g.sell_threshold = float(cfg.get('当日跌幅卖出阈值(%)', -5.0))
     # 主动换仓：第一名20日动量超过持仓20日动量多少百分点才触发
     g.switch_threshold = float(cfg.get('主动换仓动量领先阈值(%)', 3.0))
@@ -923,10 +924,10 @@ def initialize(context):
 
     log.info('=' * 60)
     log.info('ETF尾盘轮动策略(23半小时版) 初始化完成')
-    log.info('风控: 止损回撤%.1f%% | 当日跌幅%.1f%% | 防过热%.1f%%' % (
-        g.trailing_stop_pct, g.sell_threshold, g.overheat_today_pct))
-    log.info('[配置生效确认] 单次投入金额=%.0f 止损回撤=%.1f%% 当日跌幅=%.1f%% 换仓领先=%.1f%% 防过热=%.1f%%'
-             % (g.max_strategy_capital, g.trailing_stop_pct,
+    log.info('风控: 止损回撤%.1f%% | 当日跌幅%.1f%% | 准入13日%.1f%%' % (
+        g.trailing_stop_pct, g.sell_threshold, g.buy_threshold))
+    log.info('[配置生效确认] 单次投入金额=%.0f 止损回撤=%.1f%% 准入13日=%.1f%% 当日跌幅=%.1f%% 换仓领先=%.1f%% 防过热=%.1f%%'
+             % (g.max_strategy_capital, g.trailing_stop_pct, g.buy_threshold,
                 g.sell_threshold, g.switch_threshold, g.overheat_today_pct))
     log.info('=' * 60)
 

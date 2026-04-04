@@ -1,11 +1,18 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git push:*)",
-      "Bash(gh auth:*)",
-      "Bash(git remote:*)",
-      "Bash(python ptrade策略检查脚本.py \"../etf实盘_23半小时_修复版.txt\")",
-      "Bash(python docs/ptrade策略检查脚本.py \"etf实盘_23半小时_修复版.txt\")"
+      "Bash(git clone:*)",
+      "Bash(mv tmp_clone/* tmp_clone/.* .)",
+      "Bash(rm -rf tmp_clone)",
+      "Skill(update-config)",
+      "Bash(pip3 show:*)",
+      "Bash(py --version)",
+      "Read(//c/Users/lz/AppData/Local/Programs/Python//**)",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Read(//d/BaiduNetdiskDownload/**)",
+      "Bash(unzip -l \"5分钟.zip\")",
+      "Bash(unzip -p \"5分钟.zip\" \"5分钟/sh510030.csv\")"
     ]
   }
 }
