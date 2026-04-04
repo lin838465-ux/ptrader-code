@@ -1,44 +1,44 @@
-﻿# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-# 棣栨澘浣庡紑5姝㈡崯绛栫暐 - PTrade 鐗堟湰
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# 鍘熺瓥鐣ワ細https://www.joinquant.com/post/44901
-# 浣滆€咃細wywy1995 | PTrade閫傞厤锛氭墜鍔ㄤ慨澶?#
-# 閫昏緫锛氭槰鏃ラ娆℃定鍋?鈫?浠婃棩浣庡紑3%-4% 鈫?涔板叆
-# 姝㈡崯锛?5% 姝㈡崯锛?1:28 / 14:50 鑻ユ湁鍒╂鼎娓呬粨
+﻿# -*- coding: utf-8 -*-
+# ============================================================
+# 首板低开5止损策略 - PTrade 版本
+# ============================================================
+# 来源：JoinQuant https://www.joinquant.com/post/44901
+# 作者：wywy1995
+# PTrade适配：框架完全对齐 etf23轮动防过热.txt
 #
-# PTrade 鍏抽敭 API 宸紓锛?#   context.current_dt        鈫?context.blotter.current_dt
-#   context.previous_date     鈫?_get_previous_trading_day(context)
-#   pos.closeable_amount     鈫?pos.enable_amount锛圱+1鍙崠锛?#   order_value(code, cash)   鈫?order(code, shares, limit_price=price)
-#   order_target_value(code,0) 鈫?鍏堟鏌nable_amount鍐峯rder(..., -amount, limit_price)
-#   set_option/log.set_level 鈫?鍒犻櫎锛圥Trade涓嶆敮鎸侊級
-# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+# 逻辑：昨日首板 → 今日低开3%-4% → 买入
+#      止损-5% / 11:28止盈 / 14:50清仓
+#
+# JoinQuant → PTrade 核心差异：
+#   context.current_dt        → context.blotter.current_dt
+#   context.previous_date     → _get_previous_trading_day(context)
+#   get_current_data()[s]    → get_snapshot() / get_price()
+#   curr_data[s].is_st       → get_stock_status()
+#   curr_data[s].paused      → get_stock_status()
+#   get_security_info(s).start_date → get_stock_info()
+#   order_target_value()      → order(code, shares, limit_price)
+#   get_security_info().display_name → g.code_name 缓存
+# ============================================================
 
-import pandas as pd
 import datetime as dt
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# 宸ュ叿鍑芥暟
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────── 工具函数 ────────────────────
 
 def _get_previous_trading_day(context):
-    """鑾峰彇鍓嶄竴浜ゆ槗鏃?""
     try:
         return get_trading_day(-1)
     except Exception:
-        dt_now = context.blotter.current_dt
-        return get_trading_day(dt_now)
+        return get_trading_day(context.blotter.current_dt)
 
 
 def _same_security(code_a, code_b):
-    """鍒ゆ柇涓や釜浠ｇ爜鏄惁鍚屼竴鏍囩殑锛堟瘮杈冨墠6浣嶏級"""
     if not code_a or not code_b:
         return False
     return str(code_a)[:6] == str(code_b)[:6]
 
 
 def _get_live_price(code, direction='buy'):
-    """鑾峰彇瀹炴椂蹇収浠锋牸锛堣偂绁?浣嶅皬鏁帮級"""
     try:
         snap = get_snapshot(code)
         if not snap:
@@ -63,7 +63,6 @@ def _get_live_price(code, direction='buy'):
 
 
 def _normalize_payload(payload):
-    """鍏煎涓绘帹鍥炶皟鍙兘鏄崟涓璞℃垨鍒楄〃"""
     if not payload:
         return []
     if isinstance(payload, (list, tuple)):
@@ -72,7 +71,6 @@ def _normalize_payload(payload):
 
 
 def _refresh_pending_order():
-    """鏍规嵁褰撳墠鎸傚崟鍒锋柊寰呮垚浜ょ姸鎬?""
     try:
         open_orders = get_open_orders()
         if not open_orders:
@@ -87,15 +85,15 @@ def _refresh_pending_order():
         g.pending_order = {'code': None, 'side': None, 'order_id': None}
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# 鍒濆鍖?# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────── 初始化 ────────────────────
+
 def initialize(context):
     set_parameters(server_restart_not_do_before="1", receive_cancel_response="1")
 
     g.pending_order = {'code': None, 'side': None, 'order_id': None}
     g.code_name = {}
 
-    run_daily(context, buy,  time='09:30')
+    run_daily(context, buy, time='09:30')
     run_daily(context, sell, time='09:35')
     run_daily(context, sell, time='11:28')
     run_daily(context, sell, time='14:50')
@@ -105,16 +103,15 @@ def initialize(context):
         set_slippage(slippage=0.001)
         set_benchmark('000300.XBHS')
 
-    log.info('棣栨澘浣庡紑5姝㈡崯绛栫暐 鍒濆鍖栧畬鎴?)
+    log.info('首板低开5止损策略 初始化完成')
 
 
 def handle_data(context, data):
     pass
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# 涔板叆锛氭槰鏃ラ鏉?+ 浠婃棩浣庡紑 3%-4%
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────── 买入 ────────────────────
+
 def buy(context, data):
     if len(context.portfolio.positions) > 0:
         return
@@ -122,30 +119,30 @@ def buy(context, data):
     prev_day = _get_previous_trading_day(context)
     yesterday = prev_day.strftime('%Y-%m-%d')
     today_str = context.blotter.current_dt.strftime('%Y%m%d')
+    today_date_str = context.blotter.current_dt.strftime('%Y-%m-%d')
 
     pending = g.pending_order
     if pending.get('side') == 'buy' and pending.get('code'):
-        log.info('[涔板叆] 宸叉湁鏈畬鎴愪拱鍗曪紝绛夊緟')
+        log.info('[买入] 已有未完成买单，等待')
         return
 
     stock_list = get_Ashares(yesterday)
 
-    st_status = get_stock_status(stock_list, 'ST', today_str)
-    if st_status:
-        stock_list = [s for s in stock_list if not st_status.get(s, False)]
+    st_status = get_stock_status(stock_list, 'ST', today_str) or {}
+    stock_list = [s for s in stock_list if not st_status.get(s, False)]
 
     stock_list = [s for s in stock_list
                   if s[:2] != '68' and s[0] not in ['4', '8']]
 
-    listed_info = get_stock_info(stock_list, 'listed_date') if stock_list else {}
     today_date = context.blotter.current_dt.date()
+    listed_info = get_stock_info(stock_list, 'listed_date') if stock_list else {}
     stock_list = [s for s in stock_list
                   if s in listed_info
                   and listed_info[s].get('listed_date')
                   and (today_date - dt.datetime.strptime(
                       listed_info[s]['listed_date'], '%Y-%m-%d').date()).days > 250]
 
-    halt_status = get_stock_status(stock_list, 'HALT', today_str) if stock_list else {}
+    halt_status = get_stock_status(stock_list, 'HALT', today_str) or {}
     stock_list = [s for s in stock_list if not halt_status.get(s, False)]
 
     if not stock_list:
@@ -195,7 +192,7 @@ def buy(context, data):
 
     buy_list = []
     today_open_df = get_price(first_limit,
-                               end_date=context.blotter.current_dt.strftime('%Y-%m-%d'),
+                               end_date=today_date_str,
                                count=1, fields=['open'], panel=False)
     if today_open_df.empty:
         return
@@ -209,8 +206,7 @@ def buy(context, data):
         if 0.96 <= open_p / close_p <= 0.97:
             buy_list.append(code)
 
-    if st_status:
-        buy_list = [s for s in buy_list if not st_status.get(s, False)]
+    buy_list = [s for s in buy_list if not st_status.get(s, False)]
 
     if not buy_list:
         return
@@ -220,7 +216,7 @@ def buy(context, data):
         if is_trade():
             buy_price = _get_live_price(code, direction='buy')
             if not buy_price:
-                log.warning('[涔板叆] 鏃犳硶鑾峰彇浠锋牸 %s锛岃烦杩? % code)
+                log.warning('[买入] 无法获取价格 %s，跳过' % code)
                 continue
         else:
             try:
@@ -241,26 +237,25 @@ def buy(context, data):
                 else:
                     buy_price = round(float(last[4]) * 1.002, 2)
             except Exception:
-                log.warning('[涔板叆] 鏃犳硶鑾峰彇鍥炴祴浠锋牸 %s' % code)
+                log.warning('[买入] 无法获取回测价格 %s' % code)
                 continue
 
         shares = (int(cash / buy_price) // 100) * 100
         if shares <= 0:
-            log.info('[涔板叆] 璧勯噾涓嶈冻 %s' % code)
+            log.info('[买入] 资金不足 %s' % code)
             continue
 
         name_info = get_stock_name([code])
         name = name_info.get(code, code) if isinstance(name_info, dict) else code
         g.code_name[code] = name
-        log.info('[涔板叆] %s 鎶ヤ环%.2f 鏁伴噺%d' % (name, buy_price, shares))
+        log.info('[买入] %s 报价%.2f 数量%d' % (name, buy_price, shares))
         oid = order(code, shares, limit_price=buy_price)
         if oid is not None:
             g.pending_order = {'code': code, 'side': 'buy', 'order_id': oid}
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# 鍗栧嚭锛氭鎹?-5%锛?1:28 / 14:50 姝㈢泩娓呬粨
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────── 卖出 ────────────────────
+
 def sell(context, data):
     hold = list(context.portfolio.positions.keys())
     if not hold:
@@ -299,7 +294,7 @@ def sell(context, data):
                             order(code, -sell_amount, limit_price=sp)
                     else:
                         order(code, -sell_amount)
-            log.info('[ST寮哄埗鍗栧嚭] %s' % code)
+            log.info('[ST强制卖出] %s' % code)
             continue
 
         pos = context.portfolio.positions.get(code)
@@ -307,7 +302,7 @@ def sell(context, data):
             continue
         sell_amount = int(float(pos.enable_amount))
         if sell_amount <= 0:
-            log.info('[鍗栧嚭] T+1闄愬埗锛屽綋鏃ヤ拱鍏ユ棤娉曞崠鍑?%s' % code)
+            log.info('[卖出] T+1限制，当日买入无法卖出 %s' % code)
             continue
 
         cost = float(getattr(pos, 'avg_cost', 0) or 0)
@@ -317,7 +312,7 @@ def sell(context, data):
         if now <= cost * 0.95:
             pending = g.pending_order
             if pending.get('side') == 'sell' and _same_security(pending.get('code'), code):
-                log.info('[鍗栧嚭] 宸叉湁鏈畬鎴愬崠鍗曪紝绛夊緟 %s' % code)
+                log.info('[卖出] 已有未完成卖单，等待 %s' % code)
                 continue
             name = g.code_name.get(code, code)
             if is_trade():
@@ -330,7 +325,7 @@ def sell(context, data):
                 oid = order(code, -sell_amount)
             if oid is not None:
                 g.pending_order = {'code': code, 'side': 'sell', 'order_id': oid}
-            log.info('[%s姝㈡崯] 鍗栧嚭锛?s' % (name, code))
+            log.info('[%s止损] 卖出：%s' % (name, code))
             continue
 
         if t == '11:28:00' and now > cost and now < high_lmt:
@@ -348,7 +343,7 @@ def sell(context, data):
                 oid = order(code, -sell_amount)
             if oid is not None:
                 g.pending_order = {'code': code, 'side': 'sell', 'order_id': oid}
-            log.info('[11:28姝㈢泩] 鍗栧嚭锛?s' % name)
+            log.info('[11:28止盈] 卖出：%s' % name)
             continue
 
         if t == '14:50:00' and now < high_lmt:
@@ -366,13 +361,12 @@ def sell(context, data):
                 oid = order(code, -sell_amount)
             if oid is not None:
                 g.pending_order = {'code': code, 'side': 'sell', 'order_id': oid}
-            log.info('[14:50娓呬粨] 鍗栧嚭锛?s' % name)
+            log.info('[14:50清仓] 卖出：%s' % name)
             continue
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# 鍥炶皟鍑芥暟
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ──────────────────── 回调函数 ────────────────────
+
 def on_order_response(context, order_list):
     if not is_trade():
         return
@@ -381,9 +375,9 @@ def on_order_response(context, order_list):
             status = str(item.get('status', ''))
             error_info = str(item.get('error_info', '')).strip()
             if error_info:
-                log.error('[濮旀墭寮傚父] %s status=%s error=%s' % (item.get('stock_code', ''), status, error_info))
+                log.error('[委托异常] %s status=%s error=%s' % (item.get('stock_code', ''), status, error_info))
             if status == '9':
-                log.warning('[搴熷崟] %s' % item.get('stock_code', ''))
+                log.warning('[废单] %s' % item.get('stock_code', ''))
             if status in ['5', '6', '8', '9']:
                 _refresh_pending_order()
         except Exception:
@@ -400,7 +394,7 @@ def on_trade_response(context, trade_list):
             real_type = str(item.get('real_type', '0'))
             cancel_info = str(item.get('cancel_info', '')).strip()
             if real_type == '2' or cancel_info:
-                log.warning('[鎾ゅ崟鎴愪氦] %s' % stock_code)
+                log.warning('[撤单成交] %s' % stock_code)
                 _refresh_pending_order()
                 continue
             if business_amount <= 0:
@@ -408,9 +402,9 @@ def on_trade_response(context, trade_list):
             entrust_bs = str(item.get('entrust_bs', ''))
             if entrust_bs == '1':
                 g.pending_order = {'code': None, 'side': None, 'order_id': None}
-                log.info('[涔板叆鎴愪氦] %s' % stock_code)
+                log.info('[买入成交] %s' % stock_code)
             elif entrust_bs == '2':
                 g.pending_order = {'code': None, 'side': None, 'order_id': None}
-                log.info('[鍗栧嚭鎴愪氦] %s' % stock_code)
+                log.info('[卖出成交] %s' % stock_code)
         except Exception:
             pass
