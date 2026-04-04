@@ -1,0 +1,636 @@
+# ═══════════════════════════════════════════════════════════════
+# 涨停低吸优化版 - PTrade
+# ─────────────────────────────────────────────────────────────
+# 综合自：4号低开低吸 + 首板低开 + 集合竞价三合一
+#
+# 核心逻辑：
+#   近5日有涨停记忆 → 昨日回调 → 今日轻微低开 → 打分选最优1只买入
+#   盘中 +5% 止盈（立即卖）
+#   14:55 检查止损（-5%才卖，没到不卖）
+#   最长持仓7天超时平仓
+#
+# 与原策略区别：
+#   - 只买1只（可配置）
+#   - 大市值优先（主板，流通市值排序）
+#   - 止盈止损默认±5%（可配置）
+#   - 持仓平均2-3天
+#   - 全面PTrade兼容（对齐etf23参考策略）
+# ═══════════════════════════════════════════════════════════════
+
+import datetime as dt
+
+
+# ─────────────────────────────────────────────────────────────
+# 用户可调参数
+# ─────────────────────────────────────────────────────────────
+
+CONF = {
+    '每日买入只数': 1,           # 每天最多买几只，建议1
+    '止盈比例(%)': 5.0,          # 盘中达到就卖，默认+5%
+    '止损比例(%)': 5.0,          # 14:55检查，达到才卖，默认-5%
+    '最长持仓天数': 7,           # 超过N天强制平仓
+    '低开下限(%)': -9.0,         # 低开太多不买
+    '低开上限(%)': 0.3,          # 高开不买（微高开0.3%以内可以）
+    '理想低开(%)': -1.2,         # 打分基准：低开-1.2%最佳
+    '要求昨日回调': True,        # 昨天必须是阴线或下跌
+    '偏好大市值': True,          # 大市值加分
+    '主板池上限': 1500,          # 流通市值前1500只
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# PTrade兼容层（对齐etf23参考策略）
+# ─────────────────────────────────────────────────────────────
+
+def _extract_val(raw_dict, code):
+    """从get_history(is_dict=True)返回中提取数据列表"""
+    if not raw_dict:
+        return None
+    arr = raw_dict.get(code)
+    if arr is None:
+        for old, new in [('.SS', '.XSHG'), ('.SZ', '.XSHE'),
+                         ('.XSHG', '.SS'), ('.XSHE', '.SZ')]:
+            alt = code.replace(old, new)
+            if alt in raw_dict:
+                arr = raw_dict[alt]
+                break
+        if arr is None:
+            code6 = code[:6]
+            for k in raw_dict:
+                if k[:6] == code6:
+                    arr = raw_dict[k]
+                    break
+    if arr is None or len(arr) == 0:
+        return None
+    res = []
+    for row in arr:
+        try:
+            if isinstance(row, (int, float)):
+                res.append(float(row))
+            elif hasattr(row, '__len__'):
+                if len(row) >= 5:
+                    res.append(float(row[4]))
+                elif len(row) > 0:
+                    res.append(float(row[-1]))
+        except Exception:
+            pass
+    return res if res else None
+
+
+def _get_previous_trading_day():
+    """获取上一个交易日 YYYY-MM-DD"""
+    try:
+        days = get_trade_days(count=2)
+        if days is not None and len(days) >= 2:
+            return str(days[-2])[:10]
+    except Exception:
+        pass
+    return None
+
+
+def _get_current_price(code):
+    """获取当前价（兼容回测/实盘）"""
+    if is_trade():
+        try:
+            snap = get_snapshot(code)
+            if snap:
+                info = snap.get(code)
+                if info is None:
+                    for k in snap:
+                        if k[:6] == code[:6]:
+                            info = snap[k]
+                            break
+                if info:
+                    return float(info.get('last_px', 0))
+        except Exception:
+            pass
+    try:
+        raw = get_history(1, '1d', 'close', code, fq='pre', include=True, is_dict=True)
+        vals = _extract_val(raw, code)
+        if vals:
+            return float(vals[-1])
+    except Exception:
+        pass
+    return 0
+
+
+def _get_open_price(code):
+    """获取今日开盘价（兼容回测/实盘）"""
+    if is_trade():
+        try:
+            snap = get_snapshot(code)
+            if snap:
+                info = snap.get(code)
+                if info is None:
+                    for k in snap:
+                        if k[:6] == code[:6]:
+                            info = snap[k]
+                            break
+                if info:
+                    return float(info.get('open_px', 0))
+        except Exception:
+            pass
+    try:
+        raw = get_history(1, '1d', 'open', code, fq='pre', include=True, is_dict=True)
+        vals = _extract_val(raw, code)
+        if vals:
+            return float(vals[-1])
+    except Exception:
+        pass
+    return 0
+
+
+def _do_sell(code, amount, price=None):
+    """统一卖出：实盘用snapshot报价，回测用当前价"""
+    if is_trade():
+        try:
+            snap = get_snapshot(code)
+            if snap:
+                info = snap.get(code)
+                if info is None:
+                    for k in snap:
+                        if k[:6] == code[:6]:
+                            info = snap[k]
+                            break
+                if info:
+                    sp = round(float(info.get('last_px', 0)) * 0.998, 2)
+                    if sp > 0:
+                        return order(code, -amount, limit_price=sp)
+        except Exception:
+            pass
+    if price and price > 0:
+        return order(code, -amount, limit_price=round(float(price) * 0.998, 2))
+    return order(code, -amount)
+
+
+def _normalize_code(stock):
+    """提取纯数字代码"""
+    if stock is None:
+        return ''
+    return str(stock).split('.')[0]
+
+
+# ─────────────────────────────────────────────────────────────
+# 初始化
+# ─────────────────────────────────────────────────────────────
+
+def initialize(context):
+    set_parameters(server_restart_not_do_before="1", receive_cancel_response="1")
+
+    if not is_trade():
+        set_commission(commission_ratio=0.0003)
+        set_slippage(slippage=0.001)
+        set_benchmark('000300.SS')
+
+    # 读取配置
+    g.buy_count = CONF['每日买入只数']
+    g.tp_ratio = CONF['止盈比例(%)'] / 100.0
+    g.sl_ratio = CONF['止损比例(%)'] / 100.0
+    g.max_hold_days = CONF['最长持仓天数']
+    g.min_open_gap = CONF['低开下限(%)'] / 100.0
+    g.max_open_gap = CONF['低开上限(%)'] / 100.0
+    g.target_open_gap = CONF['理想低开(%)'] / 100.0
+    g.require_pullback = CONF['要求昨日回调']
+    g.prefer_large_cap = CONF['偏好大市值']
+    g.max_pool = CONF['主板池上限']
+
+    # 日内状态
+    g.hold_days = {}          # {code: 持仓天数}
+    g.stock_pool = []         # 每日主板候选池
+    g.today_bought = 0        # 今日已买数量
+    g.pending_order = {'code': None, 'side': None}
+
+    # 定时任务
+    buy_time = '09:27' if is_trade() else '09:30'
+    run_daily(context, _execute_buy, time=buy_time)
+    run_daily(context, _check_stop_loss, time='14:55')
+
+    log.info('═══════════════════════════════════════════════')
+    log.info('  涨停低吸优化版')
+    log.info('  买入: %s | 止盈: +%.1f%% | 止损: -%.1f%%(14:55)' % (
+        buy_time, g.tp_ratio * 100, g.sl_ratio * 100))
+    log.info('  只数: %d | 持仓上限: %d天 | 大市值偏好: %s' % (
+        g.buy_count, g.max_hold_days, g.prefer_large_cap))
+    log.info('═══════════════════════════════════════════════')
+
+
+def before_trading_start(context, data):
+    """盘前：建池、同步持仓天数"""
+    g.pending_order = {'code': None, 'side': None}
+    g.today_bought = 0
+
+    # 同步持仓天数
+    positions = get_positions()
+    for stock in list(g.hold_days.keys()):
+        if stock not in positions or positions[stock].amount <= 0:
+            del g.hold_days[stock]
+        else:
+            g.hold_days[stock] += 1
+
+    # 建主板池
+    g.stock_pool = _build_main_board_pool(context)
+    if g.stock_pool:
+        try:
+            set_universe(g.stock_pool)
+        except Exception:
+            pass
+    log.info('[盘前] 主板候选池: %d只' % len(g.stock_pool))
+
+
+# ─────────────────────────────────────────────────────────────
+# 盘中：每分钟止盈检查
+# ─────────────────────────────────────────────────────────────
+
+def handle_data(context, data):
+    """盘中止盈：达到+N%立即卖"""
+    positions = get_positions()
+    if not positions:
+        return
+
+    for code, pos in positions.items():
+        if pos.amount <= 0:
+            continue
+        enable = int(float(getattr(pos, 'enable_amount', 0)))
+        if enable <= 0:
+            continue
+
+        cost = float(getattr(pos, 'cost_basis', 0) or 0)
+        if cost <= 0:
+            continue
+
+        px = _get_current_price(code)
+        if px <= 0:
+            continue
+
+        ret = px / cost - 1
+        if ret >= g.tp_ratio:
+            # 防重复
+            pending = g.pending_order
+            if pending.get('side') == 'sell' and pending.get('code') and pending['code'][:6] == code[:6]:
+                continue
+            sell_amount = (enable // 100) * 100
+            if sell_amount >= 100:
+                oid = _do_sell(code, sell_amount, px)
+                if oid:
+                    g.pending_order = {'code': code, 'side': 'sell'}
+                log.info('[盘中止盈] %s | 成本:%.2f | 现价:%.2f | +%.2f%% | 持%d天' % (
+                    code, cost, px, ret * 100, g.hold_days.get(code, 0)))
+                if code in g.hold_days:
+                    del g.hold_days[code]
+
+
+# ─────────────────────────────────────────────────────────────
+# 买入逻辑（9:27实盘 / 9:30回测）
+# ─────────────────────────────────────────────────────────────
+
+def _execute_buy(context):
+    if g.today_bought >= g.buy_count:
+        return
+
+    # 有持仓就不买（1只策略）
+    positions = get_positions()
+    if positions:
+        for code, pos in positions.items():
+            if pos.amount > 0:
+                log.info('[买入跳过] 已有持仓: %s' % code)
+                return
+
+    # 大盘过滤
+    if _is_market_crash():
+        log.info('[大盘过滤] 沪深300跌超1.5%%，今日不买')
+        return
+
+    # 选股打分
+    candidates = _get_candidates(context)
+    if not candidates:
+        log.info('[选股] 今日无符合条件标的')
+        return
+
+    # 打印前5名
+    for i, item in enumerate(candidates[:5]):
+        log.info('[候选%d] %s | 低开:%.2f%% | 昨跌:%.2f%% | 涨停距:第%d天 | 得分:%.3f' % (
+            i + 1, item['stock'], item['open_gap'] * 100,
+            item['y_ret'] * 100, item['days_since_limit'], item['score']))
+
+    # 买最优的1只
+    best = candidates[0]
+    code = best['stock']
+    cash = context.portfolio.cash * 0.98
+    if cash < 2000:
+        log.info('[买入跳过] 可用资金不足: %.0f' % cash)
+        return
+
+    # 获取买入价
+    buy_px = _get_open_price(code)
+    if buy_px <= 0:
+        buy_px = _get_current_price(code)
+    if buy_px <= 0:
+        log.warning('[买入] 无法获取价格 %s' % code)
+        return
+
+    buy_price = round(buy_px * 1.002, 2)  # 上浮0.2%确保成交
+    shares = (int(cash / buy_price) // 100) * 100
+    if shares < 100:
+        return
+
+    oid = order(code, shares, limit_price=buy_price)
+    if oid:
+        g.hold_days[code] = 0
+        g.today_bought += 1
+        g.pending_order = {'code': code, 'side': 'buy'}
+        log.info('[买入] %s | 价:%.2f | 量:%d | 低开:%.2f%% | 得分:%.3f' % (
+            code, buy_price, shares, best['open_gap'] * 100, best['score']))
+
+
+# ─────────────────────────────────────────────────────────────
+# 14:55 止损 + 超时平仓
+# ─────────────────────────────────────────────────────────────
+
+def _check_stop_loss(context):
+    """14:55检查：达到止损才卖，没到不卖"""
+    positions = get_positions()
+    if not positions:
+        return
+
+    for code, pos in positions.items():
+        if pos.amount <= 0:
+            continue
+        enable = int(float(getattr(pos, 'enable_amount', 0)))
+        if enable <= 0:
+            continue
+
+        cost = float(getattr(pos, 'cost_basis', 0) or 0)
+        px = _get_current_price(code)
+        if cost <= 0 or px <= 0:
+            continue
+
+        ret = px / cost - 1
+        hold = g.hold_days.get(code, 0)
+        sell_amount = (enable // 100) * 100
+        if sell_amount < 100:
+            continue
+
+        # 止损：亏损超过阈值
+        if ret <= -g.sl_ratio:
+            oid = _do_sell(code, sell_amount, px)
+            if oid:
+                g.pending_order = {'code': code, 'side': 'sell'}
+            log.info('[14:55止损] %s | 成本:%.2f | 现价:%.2f | %.2f%% | 持%d天' % (
+                code, cost, px, ret * 100, hold))
+            if code in g.hold_days:
+                del g.hold_days[code]
+
+        # 超时：持仓超过N天
+        elif hold >= g.max_hold_days:
+            oid = _do_sell(code, sell_amount, px)
+            if oid:
+                g.pending_order = {'code': code, 'side': 'sell'}
+            log.info('[14:55超时] %s | 持%d天 | 盈亏:%.2f%%' % (code, hold, ret * 100))
+            if code in g.hold_days:
+                del g.hold_days[code]
+
+        # 没到止损也没超时 → 不卖，继续持有
+        else:
+            log.info('[14:55持有] %s | 成本:%.2f | 现价:%.2f | %.2f%% | 持%d天' % (
+                code, cost, px, ret * 100, hold))
+
+
+# ─────────────────────────────────────────────────────────────
+# 选股 + 打分
+# ─────────────────────────────────────────────────────────────
+
+def _get_candidates(context):
+    """选股：近5日有涨停 + 昨日回调 + 今日低开 → 打分排序"""
+    if not g.stock_pool:
+        return []
+
+    # 批量获取近8日收盘价和开盘价（分开调用，PTrade不支持list字段）
+    closes_dict = {}
+    opens_dict = {}
+    for code in g.stock_pool:
+        try:
+            raw_c = get_history(8, '1d', 'close', code, fq='pre', include=False, is_dict=True)
+            raw_o = get_history(8, '1d', 'open', code, fq='pre', include=False, is_dict=True)
+            cl = _extract_val(raw_c, code)
+            ol = _extract_val(raw_o, code)
+            if cl and ol and len(cl) >= 7 and len(ol) >= 7:
+                closes_dict[code] = cl
+                opens_dict[code] = ol
+        except Exception:
+            pass
+
+    candidates = []
+    for code in g.stock_pool:
+        if code not in closes_dict or code not in opens_dict:
+            continue
+
+        closes = closes_dict[code]
+        opens = opens_dict[code]
+
+        y_close = closes[-1]
+        y_open = opens[-1]
+        prev_close = closes[-2]
+        if y_close <= 0 or prev_close <= 0 or y_open <= 0:
+            continue
+
+        # ── 条件1：近5日内有涨停记忆 ──
+        latest_limit_idx = None
+        for i in range(-6, -1):
+            base = closes[i - 1]
+            curr = closes[i]
+            if base <= 0:
+                continue
+            if curr / base - 1 >= 0.095:  # 涨幅≥9.5%视为涨停
+                latest_limit_idx = i
+        if latest_limit_idx is None:
+            continue
+        days_since_limit = abs(latest_limit_idx + 1)
+
+        # ── 条件2：昨日回调 ──
+        y_ret = y_close / prev_close - 1
+        is_pullback = (y_close < y_open) or (y_close < prev_close)
+        if g.require_pullback and not is_pullback:
+            continue
+
+        # ── 条件3：今日低开 ──
+        open_px = _get_open_price(code)
+        if open_px <= 0:
+            continue
+        open_gap = open_px / y_close - 1
+        if open_gap < g.min_open_gap or open_gap > g.max_open_gap:
+            continue
+
+        # ── 打分（越低越好）──
+        # 1. 低开接近理想值-1.2%得分最低
+        gap_penalty = abs(open_gap - g.target_open_gap) * 100
+        # 2. 涨停越近越好
+        limit_recency_penalty = days_since_limit * 0.6
+        # 3. 昨天回调幅度适中（-1%~-3%最佳，极端回调扣分）
+        pullback_penalty = abs(y_ret) * 8
+        # 4. 低开太深额外扣分
+        deep_gap_penalty = max(0, abs(open_gap) - 0.03) * 20
+        # 5. 高开扣分
+        positive_gap_penalty = max(0, open_gap) * 40
+        # 6. 昨日实体太大扣分
+        y_body_ret = y_close / y_open - 1 if y_open > 0 else 0
+        body_penalty = max(0, abs(y_body_ret) - 0.08) * 20
+
+        score = (gap_penalty + limit_recency_penalty + pullback_penalty
+                 + deep_gap_penalty + positive_gap_penalty + body_penalty)
+
+        candidates.append({
+            'stock': code,
+            'open_gap': open_gap,
+            'y_ret': y_ret,
+            'y_close': y_close,
+            'is_pullback': is_pullback,
+            'days_since_limit': days_since_limit,
+            'score': score,
+        })
+
+    # ── 大市值偏好：流通市值越大得分越低 ──
+    if g.prefer_large_cap and candidates:
+        _apply_large_cap_bonus(context, candidates)
+
+    # 得分从低到高排序
+    candidates.sort(key=lambda x: x['score'])
+    return candidates
+
+
+def _apply_large_cap_bonus(context, candidates):
+    """大市值加分（降低score）"""
+    codes = [item['stock'] for item in candidates]
+    try:
+        yesterday = _get_previous_trading_day()
+        if not yesterday:
+            return
+        df = get_fundamentals(codes, 'valuation',
+                             fields=['float_value'],
+                             date=yesterday.replace('-', ''))
+        if df is None or df.empty or 'float_value' not in df.columns:
+            return
+        df = df.sort_values(by='float_value', ascending=False)
+        total = max(len(df) - 1, 1)
+        cap_map = {}
+        for idx, (code, row) in enumerate(df.iterrows()):
+            cap_map[code] = (idx / float(total)) * 1.2  # 大市值排名越前penalty越低
+        for item in candidates:
+            code = item['stock']
+            if code in cap_map:
+                item['score'] += cap_map[code]
+    except Exception as e:
+        log.warning('[市值因子] 获取失败: %s' % str(e))
+
+
+# ─────────────────────────────────────────────────────────────
+# 建主板池（大市值优先）
+# ─────────────────────────────────────────────────────────────
+
+def _build_main_board_pool(context):
+    """构建主板大市值候选池"""
+    try:
+        all_stocks = get_Ashares()
+    except Exception:
+        return []
+    if not all_stocks:
+        return []
+
+    # 只留主板（60/000/001/002/003/605/603开头）
+    main_board = []
+    for s in all_stocks:
+        c = _normalize_code(s)
+        if c.startswith(('60', '000', '001', '002', '003', '605', '603')):
+            if not c.startswith(('300', '301', '688', '8')):
+                main_board.append(s)
+
+    if not main_board:
+        return []
+
+    # 按流通市值排序，取前N只
+    try:
+        yesterday = _get_previous_trading_day()
+        if yesterday:
+            df = get_fundamentals(main_board, 'valuation',
+                                 fields=['float_value'],
+                                 date=yesterday.replace('-', ''))
+            if df is not None and not df.empty and 'float_value' in df.columns:
+                df = df.sort_values(by='float_value', ascending=False)
+                main_board = df.head(g.max_pool).index.tolist()
+    except Exception as e:
+        log.warning('[建池] 市值排序失败: %s' % str(e))
+
+    # 过滤ST/停牌/退市
+    try:
+        main_board = filter_stock_by_status(
+            main_board,
+            filter_type=['ST', 'HALT', 'DELISTING'],
+            query_date=None)
+    except Exception:
+        # fallback: 手动过滤
+        try:
+            st = get_stock_status(main_board, 'ST') or {}
+            halt = get_stock_status(main_board, 'HALT') or {}
+            main_board = [s for s in main_board
+                         if not st.get(s, False) and not halt.get(s, False)]
+        except Exception:
+            pass
+
+    return main_board
+
+
+def _is_market_crash():
+    """沪深300跌超1.5%返回True"""
+    try:
+        raw = get_history(2, '1d', 'close', '000300.SS', fq='pre', include=True, is_dict=True)
+        vals = None
+        if raw:
+            for k in raw:
+                vals = raw[k]
+                break
+        if vals and len(vals) >= 2:
+            chg = (float(vals[-1]) - float(vals[-2])) / float(vals[-2])
+            return chg < -0.015
+    except Exception:
+        pass
+    return False
+
+
+# ─────────────────────────────────────────────────────────────
+# 回调函数
+# ─────────────────────────────────────────────────────────────
+
+def on_order_response(context, order_list):
+    """委托回调"""
+    if not is_trade():
+        return
+    for item in (order_list if isinstance(order_list, list) else [order_list]):
+        try:
+            status = str(item.get('status', ''))
+            error_info = str(item.get('error_info', '')).strip()
+            if error_info:
+                log.error('[委托异常] %s error=%s' % (item.get('stock_code', ''), error_info))
+            if status in ['5', '6', '8', '9']:
+                g.pending_order = {'code': None, 'side': None}
+        except Exception:
+            pass
+
+
+def on_trade_response(context, trade_list):
+    """成交回调"""
+    if not is_trade():
+        return
+    for item in (trade_list if isinstance(trade_list, list) else [trade_list]):
+        try:
+            stock_code = str(item.get('stock_code', ''))
+            business_amount = float(item.get('business_amount', 0) or 0)
+            if business_amount <= 0:
+                continue
+            entrust_bs = str(item.get('entrust_bs', ''))
+            if entrust_bs == '1':
+                g.pending_order = {'code': None, 'side': None}
+                log.info('[买入成交] %s' % stock_code)
+            elif entrust_bs == '2':
+                g.pending_order = {'code': None, 'side': None}
+                log.info('[卖出成交] %s' % stock_code)
+        except Exception:
+            pass
