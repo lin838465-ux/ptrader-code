@@ -26,16 +26,31 @@ import datetime as dt
 # ──────────────────── 工具函数 ────────────────────
 
 def _get_previous_trading_day(context):
+    """获取上一个交易日，返回字符串'YYYY-MM-DD'"""
     try:
-        return get_trading_day(-1)
+        days = get_trade_days(count=2)
+        if days is not None and len(days) >= 2:
+            return str(days[-2])[:10]
+        return str(days[-1])[:10] if days is not None and len(days) >= 1 else None
     except Exception:
-        return get_trading_day(context.blotter.current_dt)
+        import datetime as _dt
+        return (context.blotter.current_dt - _dt.timedelta(days=1)).strftime('%Y-%m-%d')
 
 
 def _same_security(code_a, code_b):
     if not code_a or not code_b:
         return False
     return str(code_a)[:6] == str(code_b)[:6]
+
+
+def _listed_days(listed_date_str, today_date):
+    """计算上市天数，兼容YYYYMMDD和YYYY-MM-DD格式"""
+    try:
+        s = str(listed_date_str).replace('-', '')[:8]
+        ld = dt.datetime.strptime(s, '%Y%m%d').date()
+        return (today_date - ld).days
+    except Exception:
+        return 0
 
 
 def _get_live_price(code, direction='buy'):
@@ -68,6 +83,38 @@ def _normalize_payload(payload):
     if isinstance(payload, (list, tuple)):
         return list(payload)
     return [payload]
+
+
+def _do_sell(code, sell_amount, now=None):
+    """统一卖出函数：实盘用snapshot报价，回测用get_history报价"""
+    if is_trade():
+        sp = _get_live_price(code, direction='sell')
+        if sp:
+            return order(code, -sell_amount, limit_price=sp)
+        return None
+    else:
+        # 回测也要传limit_price
+        if now and now > 0:
+            sell_price = round(float(now) * 0.998, 2)
+        else:
+            try:
+                raw = get_history(1, '1d', 'close', code, fq='pre', include=True, is_dict=True)
+                if raw:
+                    for k in raw:
+                        if k[:6] == code[:6]:
+                            vals = raw[k]
+                            px = float(vals[-1]) if isinstance(vals[-1], (int, float)) else float(vals[-1][4])
+                            sell_price = round(px * 0.998, 2)
+                            break
+                    else:
+                        sell_price = None
+                else:
+                    sell_price = None
+            except Exception:
+                sell_price = None
+        if sell_price:
+            return order(code, -sell_amount, limit_price=sell_price)
+        return order(code, -sell_amount)
 
 
 def _refresh_pending_order():
@@ -106,18 +153,80 @@ def initialize(context):
     log.info('首板低开5止损策略 初始化完成')
 
 
+def before_trading_start(context, data):
+    """盘前重置状态"""
+    g.pending_order = {'code': None, 'side': None, 'order_id': None}
+    log.info('[盘前] 首板低开策略准备就绪')
+
+
 def handle_data(context, data):
-    pass
+    """盘中止损检查（每分钟）"""
+    now = context.blotter.current_dt
+    t = now.strftime('%H:%M')
+    if t < '09:35' or t >= '14:50':
+        return
+    # 盘中实时-5%止损
+    positions = get_positions()
+    if not positions:
+        return
+    for code, pos in positions.items():
+        if pos.amount <= 0:
+            continue
+        enable = int(float(getattr(pos, 'enable_amount', 0)))
+        if enable <= 0:
+            continue
+        cost = float(getattr(pos, 'cost_basis', 0) or 0)
+        if cost <= 0:
+            continue
+        # 获取当前价
+        px = 0
+        if is_trade():
+            try:
+                snap = get_snapshot(code)
+                if snap:
+                    info = snap.get(code)
+                    if info is None:
+                        for k in snap:
+                            if k[:6] == code[:6]:
+                                info = snap[k]
+                                break
+                    if info:
+                        px = float(info.get('last_px', 0))
+            except Exception:
+                pass
+        if px <= 0:
+            try:
+                raw = get_history(1, '1d', 'close', code, fq='pre', include=True, is_dict=True)
+                if raw:
+                    for k in raw:
+                        if k[:6] == code[:6]:
+                            vals = raw[k]
+                            px = float(vals[-1]) if isinstance(vals[-1], (int, float)) else float(vals[-1][4])
+                            break
+            except Exception:
+                pass
+        if px <= 0:
+            continue
+        if px <= cost * 0.95:
+            pending = g.pending_order
+            if pending.get('side') == 'sell' and _same_security(pending.get('code'), code):
+                continue
+            sell_amount = (enable // 100) * 100
+            if sell_amount >= 100:
+                oid = _do_sell(code, sell_amount, px)
+                if oid is not None:
+                    g.pending_order = {'code': code, 'side': 'sell', 'order_id': oid}
+                pnl = (px - cost) / cost * 100
+                log.info('[盘中止损] %s | 成本:%.2f | 现价:%.2f | 亏%.2f%%' % (code, cost, px, pnl))
 
 
 # ──────────────────── 买入 ────────────────────
 
-def buy(context, data):
+def buy(context):
     if len(context.portfolio.positions) > 0:
         return
 
-    prev_day = _get_previous_trading_day(context)
-    yesterday = prev_day.strftime('%Y-%m-%d')
+    yesterday = _get_previous_trading_day(context)  # 返回 'YYYY-MM-DD'
     today_str = context.blotter.current_dt.strftime('%Y%m%d')
     today_date_str = context.blotter.current_dt.strftime('%Y-%m-%d')
 
@@ -135,12 +244,11 @@ def buy(context, data):
                   if s[:2] != '68' and s[0] not in ['4', '8']]
 
     today_date = context.blotter.current_dt.date()
-    listed_info = get_stock_info(stock_list, 'listed_date') if stock_list else {}
+    listed_info = get_stock_info(stock_list, ['listed_date']) if stock_list else {}
     stock_list = [s for s in stock_list
                   if s in listed_info
                   and listed_info[s].get('listed_date')
-                  and (today_date - dt.datetime.strptime(
-                      listed_info[s]['listed_date'], '%Y-%m-%d').date()).days > 250]
+                  and _listed_days(listed_info[s]['listed_date'], today_date) > 250]
 
     halt_status = get_stock_status(stock_list, 'HALT', today_str) or {}
     stock_list = [s for s in stock_list if not halt_status.get(s, False)]
@@ -149,14 +257,14 @@ def buy(context, data):
         return
 
     df = get_price(stock_list, end_date=yesterday, count=1,
-                   fields=['close', 'high_limit'], panel=False)
+                   fields=['close', 'high_limit'])
     df = df.dropna()
     limit_up = df[df['close'] == df['high_limit']]['code'].tolist()
     if not limit_up:
         return
 
     pre_df = get_price(limit_up, end_date=yesterday, count=2,
-                       fields=['close', 'high_limit'], panel=False)
+                       fields=['close', 'high_limit'])
     first_limit = []
     for code in limit_up:
         c = pre_df[pre_df['code'] == code]['close'].tolist()
@@ -185,7 +293,7 @@ def buy(context, data):
         return
 
     yc_df = get_price(first_limit, end_date=yesterday, count=1,
-                      fields=['close'], panel=False)
+                      fields=['close'])
     if yc_df.empty:
         return
     yc = yc_df.set_index('code')
@@ -193,7 +301,7 @@ def buy(context, data):
     buy_list = []
     today_open_df = get_price(first_limit,
                                end_date=today_date_str,
-                               count=1, fields=['open'], panel=False)
+                               count=1, fields=['open'])
     if today_open_df.empty:
         return
     today_open = today_open_df.set_index('code')
@@ -256,7 +364,7 @@ def buy(context, data):
 
 # ──────────────────── 卖出 ────────────────────
 
-def sell(context, data):
+def sell(context):
     hold = list(context.portfolio.positions.keys())
     if not hold:
         return
@@ -266,7 +374,7 @@ def sell(context, data):
     today_date_str = context.blotter.current_dt.strftime('%Y-%m-%d')
 
     price_df = get_price(hold, end_date=today_date_str, count=1,
-                         fields=['close', 'high_limit'], panel=False)
+                         fields=['close', 'high_limit'])
     if price_df.empty:
         return
     price_df = price_df.set_index('code')
@@ -288,12 +396,7 @@ def sell(context, data):
             if pos:
                 sell_amount = int(float(pos.enable_amount))
                 if sell_amount > 0:
-                    if is_trade():
-                        sp = _get_live_price(code, direction='sell')
-                        if sp:
-                            order(code, -sell_amount, limit_price=sp)
-                    else:
-                        order(code, -sell_amount)
+                    _do_sell(code, sell_amount, now=None)
             log.info('[ST强制卖出] %s' % code)
             continue
 
@@ -305,7 +408,7 @@ def sell(context, data):
             log.info('[卖出] T+1限制，当日买入无法卖出 %s' % code)
             continue
 
-        cost = float(getattr(pos, 'avg_cost', 0) or 0)
+        cost = float(getattr(pos, 'cost_basis', 0) or 0)
         now  = float(price_df.loc[code, 'close']) if code in price_df.index else cost
         high_lmt = float(price_df.loc[code, 'high_limit']) if code in price_df.index else now * 1.1
 
@@ -315,14 +418,7 @@ def sell(context, data):
                 log.info('[卖出] 已有未完成卖单，等待 %s' % code)
                 continue
             name = g.code_name.get(code, code)
-            if is_trade():
-                sp = _get_live_price(code, direction='sell')
-                if sp:
-                    oid = order(code, -sell_amount, limit_price=sp)
-                else:
-                    oid = None
-            else:
-                oid = order(code, -sell_amount)
+            oid = _do_sell(code, sell_amount, now)
             if oid is not None:
                 g.pending_order = {'code': code, 'side': 'sell', 'order_id': oid}
             log.info('[%s止损] 卖出：%s' % (name, code))
@@ -333,14 +429,7 @@ def sell(context, data):
             if pending.get('side') == 'sell' and _same_security(pending.get('code'), code):
                 continue
             name = g.code_name.get(code, code)
-            if is_trade():
-                sp = _get_live_price(code, direction='sell')
-                if sp:
-                    oid = order(code, -sell_amount, limit_price=sp)
-                else:
-                    oid = None
-            else:
-                oid = order(code, -sell_amount)
+            oid = _do_sell(code, sell_amount, now)
             if oid is not None:
                 g.pending_order = {'code': code, 'side': 'sell', 'order_id': oid}
             log.info('[11:28止盈] 卖出：%s' % name)
@@ -351,14 +440,7 @@ def sell(context, data):
             if pending.get('side') == 'sell' and _same_security(pending.get('code'), code):
                 continue
             name = g.code_name.get(code, code)
-            if is_trade():
-                sp = _get_live_price(code, direction='sell')
-                if sp:
-                    oid = order(code, -sell_amount, limit_price=sp)
-                else:
-                    oid = None
-            else:
-                oid = order(code, -sell_amount)
+            oid = _do_sell(code, sell_amount, now)
             if oid is not None:
                 g.pending_order = {'code': code, 'side': 'sell', 'order_id': oid}
             log.info('[14:50清仓] 卖出：%s' % name)

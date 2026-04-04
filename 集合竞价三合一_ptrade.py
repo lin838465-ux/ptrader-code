@@ -30,16 +30,87 @@ from datetime import datetime, timedelta
 # ──────────────────── 工具函数 ────────────────────
 
 def _get_previous_trading_day(context):
+    """获取上一个交易日，返回字符串'YYYY-MM-DD'"""
     try:
-        return get_trading_day(-1)
+        days = get_trade_days(count=2)
+        if days is not None and len(days) >= 2:
+            return str(days[-2])[:10]
+        return str(days[-1])[:10] if days is not None and len(days) >= 1 else None
     except Exception:
-        return get_trading_day(context.blotter.current_dt)
+        return (context.blotter.current_dt - dt.timedelta(days=1)).strftime('%Y-%m-%d')
 
 
 def _same_security(code_a, code_b):
     if not code_a or not code_b:
         return False
     return str(code_a)[:6] == str(code_b)[:6]
+
+
+def _extract_val(raw_dict, code):
+    """从get_history(is_dict=True)返回中提取数据列表"""
+    if not raw_dict:
+        return None
+    arr = raw_dict.get(code)
+    if arr is None:
+        for old, new in [('.SS', '.XSHG'), ('.SZ', '.XSHE'),
+                         ('.XSHG', '.SS'), ('.XSHE', '.SZ')]:
+            alt = code.replace(old, new)
+            if alt in raw_dict:
+                arr = raw_dict[alt]
+                break
+        if arr is None:
+            code6 = code[:6]
+            for k in raw_dict:
+                if k[:6] == code6:
+                    arr = raw_dict[k]
+                    break
+    if arr is None or len(arr) == 0:
+        return None
+    res = []
+    for row in arr:
+        try:
+            if isinstance(row, (int, float)):
+                res.append(float(row))
+            elif hasattr(row, '__len__'):
+                if len(row) >= 5:
+                    res.append(float(row[4]))
+                elif len(row) > 0:
+                    res.append(float(row[-1]))
+        except Exception:
+            pass
+    return res if res else None
+
+
+def _listed_days(listed_date_str, today_date):
+    """计算上市天数，兼容YYYYMMDD和YYYY-MM-DD格式"""
+    try:
+        s = str(listed_date_str).replace('-', '')[:8]
+        ld = dt.datetime.strptime(s, '%Y%m%d').date()
+        return (today_date - ld).days
+    except Exception:
+        return 0
+
+
+def _do_sell(code, sell_amount, now=None):
+    """统一卖出函数：实盘用snapshot报价，回测用当前价报价"""
+    if is_trade():
+        sp = _get_live_price(code, direction='sell')
+        if sp:
+            return order(code, -sell_amount, limit_price=sp)
+        return None
+    else:
+        if now and now > 0:
+            sell_price = round(float(now) * 0.998, 2)
+        else:
+            try:
+                raw = get_history(1, '1d', 'close', code, fq='pre', include=True, is_dict=True)
+                vals = _extract_val(raw, code)
+                sell_price = round(vals[-1] * 0.998, 2) if vals else None
+            except Exception:
+                sell_price = None
+        if sell_price:
+            return order(code, -sell_amount, limit_price=sell_price)
+        return order(code, -sell_amount)
 
 
 def _get_live_price(code, direction='buy'):
@@ -132,12 +203,11 @@ def _get_shifted_date(date, days, days_type='T'):
 
 def _filter_new_stock(initial_list, date, days=50):
     d_date = _transform_date(date, 'd')
-    listed_info = get_stock_info(initial_list, 'listed_date') if initial_list else {}
+    listed_info = get_stock_info(initial_list, ['listed_date']) if initial_list else {}
     return [s for s in initial_list
             if s in listed_info
             and listed_info[s].get('listed_date')
-            and (d_date - dt.datetime.strptime(
-                listed_info[s]['listed_date'], '%Y-%m-%d').date()).days > days]
+            and _listed_days(listed_info[s]['listed_date'], d_date) > days]
 
 
 def _filter_new_stock2(initial_list, date, days=250):
@@ -271,49 +341,63 @@ def _get_relative_position_df(stock_list, date, watch_days):
 # ──────────────────── 左压天数 ────────────────────
 
 def _calculate_zyts(s, context):
-    high_h = get_history(101, '1d', 'high', security_list=s,
-                       fq=None, include=False)
-    if high_h is None or len(high_h) < 2:
+    raw_h = get_history(101, '1d', 'high', s, fq='pre', include=False, is_dict=True)
+    highs = _extract_val(raw_h, s)
+    if highs is None or len(highs) < 2:
         return 10
-    highs = high_h['high']
-    prev_high = highs.iloc[-1]
-    zyts_0 = next((i - 1 for i, h in enumerate(highs.iloc[-3::-1], 2)
-                   if h >= prev_high), 100)
+    prev_high = highs[-1]
+    zyts_0 = 100
+    for i, h in enumerate(reversed(highs[:-2]), 2):
+        if h >= prev_high:
+            zyts_0 = i - 1
+            break
     return zyts_0 + 5
 
 
 # ──────────────────── 竞价数据 ────────────────────
 
-def _get_auction_data(s, context, prev_vol_df=None):
+def _get_auction_data(s, context, prev_vol=None):
+    """获取竞价数据：实盘用get_trend_data，回测用开盘价近似
+    参数: prev_vol — 昨日成交量(数值)
+    返回: (竞价量, 竞价价格, 昨日涨停价) 或 (None, None, None)
+    """
     if is_trade():
         try:
             today_str = context.blotter.current_dt.strftime('%Y%m%d')
             td = get_trend_data(date=today_str, stocks=s)
-            if not td or s not in td:
+            if not td:
                 return None, None, None
-            auction_vol = td[s].get('business_amount', 0)
-            auction_px = td[s].get('hq_px', 0)
-            prev_day = _get_previous_trading_day(context)
-            yest_str = prev_day.strftime('%Y-%m-%d')
-            hl_df = get_price(s, end_date=yest_str, count=1,
-                             fields=['high_limit'], panel=False)
-            hl_px = hl_df['high_limit'].iloc[0] if not hl_df.empty else auction_px * 1.1
+            # get_trend_data可能用不同后缀
+            info = td.get(s)
+            if info is None:
+                for k in td:
+                    if k[:6] == s[:6]:
+                        info = td[k]
+                        break
+            if not info:
+                return None, None, None
+            auction_vol = info.get('business_amount', 0)
+            auction_px = info.get('hq_px', 0)
+            # 昨日涨停价
+            yest_str = _get_previous_trading_day(context)
+            raw_hl = get_history(1, '1d', 'high_limit', s, fq='pre', include=False, is_dict=True)
+            hl_vals = _extract_val(raw_hl, s)
+            hl_px = hl_vals[-1] if hl_vals else auction_px * 1.1
             return auction_vol, auction_px, hl_px
         except Exception:
             return None, None, None
     else:
         try:
-            prev_day = _get_previous_trading_day(context)
-            today_date_str = context.blotter.current_dt.strftime('%Y-%m-%d')
-            today_ohlc = get_price(s, end_date=today_date_str, count=1,
-                                  fields=['open', 'volume'], panel=False)
-            hl_df = get_price(s, end_date=prev_day.strftime('%Y-%m-%d'), count=1,
-                             fields=['high_limit'], panel=False)
-            if today_ohlc.empty or hl_df.empty:
+            # 回测：用今日开盘价近似竞价价格，竞价量按昨日量5%估算
+            raw_o = get_history(1, '1d', 'open', s, fq='pre', include=True, is_dict=True)
+            open_vals = _extract_val(raw_o, s)
+            raw_hl = get_history(1, '1d', 'high_limit', s, fq='pre', include=False, is_dict=True)
+            hl_vals = _extract_val(raw_hl, s)
+            if not open_vals or not hl_vals:
                 return None, None, None
-            open_px = today_ohlc['open'].iloc[0]
-            auction_vol_est = prev_vol_df['volume'].iloc[-1] * 0.05 if prev_vol_df is not None else 0
-            hl_px = hl_df['high_limit'].iloc[0]
+            open_px = open_vals[-1]
+            hl_px = hl_vals[-1]
+            auction_vol_est = prev_vol * 0.05 if prev_vol else 0
             return auction_vol_est, open_px, hl_px
         except Exception:
             return None, None, None
@@ -342,13 +426,19 @@ def initialize(context):
     log.info('集合竞价三合一策略 初始化完成')
 
 
+def before_trading_start(context, data):
+    """盘前重置状态"""
+    g.pending_order = {'code': None, 'side': None, 'order_id': None}
+    log.info('[盘前] 集合竞价三合一策略准备就绪')
+
+
 def handle_data(context, data):
     pass
 
 
 # ──────────────────── 选股（9:01） ────────────────────
 
-def get_stock_list(context, data):
+def get_stock_list(context):
     prev_day = _get_previous_trading_day(context)
     date = prev_day
     date_str = _transform_date(date, 'str')
@@ -370,14 +460,13 @@ def get_stock_list(context, data):
 
 # ──────────────────── 买入（9:26） ────────────────────
 
-def buy(context, data):
+def buy(context):
     qualified_stocks = []
     gk_stocks = []
     dk_stocks = []
     rzq_stocks = []
 
-    prev_day = _get_previous_trading_day(context)
-    date_str = prev_day.strftime('%Y-%m-%d')
+    date_str = _get_previous_trading_day(context)  # 返回 'YYYY-MM-DD'
     today_str = context.blotter.current_dt.strftime('%Y%m%d')
     today_date_str = context.blotter.current_dt.strftime('%Y-%m-%d')
 
@@ -388,18 +477,30 @@ def buy(context, data):
 
     # ── 一进二 ──
     for s in g.target_list:
-        prev = get_history(1, '1d', ['close', 'volume', 'money'],
-                           security_list=s, fq=None, include=False)
-        if prev is None or prev['money'].iloc[-1] < 5.5e8 or prev['money'].iloc[-1] > 20e8:
+        try:
+            raw_c = get_history(1, '1d', 'close', s, fq='pre', include=False, is_dict=True)
+            raw_v = get_history(1, '1d', 'volume', s, fq='pre', include=False, is_dict=True)
+            raw_m = get_history(1, '1d', 'money', s, fq='pre', include=False, is_dict=True)
+            cl = _extract_val(raw_c, s)
+            vl = _extract_val(raw_v, s)
+            ml = _extract_val(raw_m, s)
+            if cl is None or vl is None or ml is None:
+                continue
+            prev_close = cl[-1]
+            prev_vol = vl[-1]
+            prev_money = ml[-1]
+        except Exception:
             continue
-        avg_px_inc = prev['money'].iloc[-1] / prev['volume'].iloc[-1] / prev['close'].iloc[-1] * 1.1 - 1
+        if prev_money < 5.5e8 or prev_money > 20e8:
+            continue
+        avg_px_inc = prev_money / prev_vol / prev_close * 1.1 - 1
         if avg_px_inc < 0.07:
             continue
 
         try:
             val = get_fundamentals(s, 'valuation',
                                   fields=['market_cap', 'circulating_market_cap'],
-                                  date=prev_day.strftime('%Y%m%d'))
+                                  date=date_str.replace('-', ''))
             if val is None or val.empty:
                 continue
             if val['market_cap'].iloc[0] < 70 or val['circulating_market_cap'].iloc[0] > 520:
@@ -408,17 +509,17 @@ def buy(context, data):
             continue
 
         zyts = _calculate_zyts(s, context)
-        vol_data = get_history(zyts, '1d', 'volume', security_list=s,
-                               fq=None, include=False)
-        if vol_data is None or len(vol_data) < 2:
+        raw_vz = get_history(zyts, '1d', 'volume', s, fq='pre', include=False, is_dict=True)
+        vols = _extract_val(raw_vz, s)
+        if vols is None or len(vols) < 2:
             continue
-        if vol_data['volume'].iloc[-1] <= vol_data['volume'].iloc[:-1].max() * 0.9:
+        if vols[-1] <= max(vols[:-1]) * 0.9:
             continue
 
-        auction_vol, auction_px, hl_px = _get_auction_data(s, context, prev)
+        auction_vol, auction_px, hl_px = _get_auction_data(s, context, prev_vol)
         if auction_vol is None:
             continue
-        if auction_vol / prev['volume'].iloc[-1] < 0.03:
+        if auction_vol / prev_vol < 0.03:
             continue
 
         current_ratio = auction_px / (hl_px / 1.1)
@@ -442,56 +543,75 @@ def buy(context, data):
             rpd = rpd[rpd['rp'] <= 0.5]
             stock_list = list(rpd.index)
 
-        if stock_list:
-            yc_df = get_price(stock_list, end_date=date_str, count=1,
-                              fields=['close'], panel=False)
-            if not yc_df.empty:
-                yc = yc_df.set_index('code')
-                today_open_df = get_price(stock_list, end_date=today_date_str,
-                                         count=1, fields=['open'], panel=False)
-                if not today_open_df.empty:
-                    today_open = today_open_df.set_index('code')
-                    for s in stock_list:
-                        if s not in yc.index or s not in today_open.index:
-                            continue
-                        open_pct = today_open.loc[s, 'open'] / yc.loc[s, 'close']
-                        if 0.955 <= open_pct <= 0.97:
-                            prev_m = get_history(1, '1d', 'money', security_list=s,
-                                                fq=None, include=False)
-                            if prev_m is not None and prev_m['money'].iloc[-1] >= 1e8:
-                                dk_stocks.append(s)
-                                qualified_stocks.append(s)
+        for s in stock_list:
+            try:
+                # 昨收
+                raw_yc = get_history(1, '1d', 'close', s, fq='pre', include=False, is_dict=True)
+                yc_vals = _extract_val(raw_yc, s)
+                if not yc_vals:
+                    continue
+                yest_close = yc_vals[-1]
+                # 今开
+                raw_to = get_history(1, '1d', 'open', s, fq='pre', include=True, is_dict=True)
+                to_vals = _extract_val(raw_to, s)
+                if not to_vals:
+                    continue
+                today_open_px = to_vals[-1]
+                open_pct = today_open_px / yest_close
+                if 0.955 <= open_pct <= 0.97:
+                    raw_pm = get_history(1, '1d', 'money', s, fq='pre', include=False, is_dict=True)
+                    pm_vals = _extract_val(raw_pm, s)
+                    if pm_vals and pm_vals[-1] >= 1e8:
+                        dk_stocks.append(s)
+                        qualified_stocks.append(s)
+            except Exception:
+                continue
 
     # ── 弱转强 ──
     for s in g.target_list2:
-        price_h = get_history(4, '1d', 'close', security_list=s,
-                             fq=None, include=False)
-        if price_h is None or len(price_h) < 4:
-            continue
-        inc = (price_h['close'].iloc[-1] - price_h['close'].iloc[0]) / price_h['close'].iloc[0]
-        if inc > 0.28:
-            continue
+        try:
+            # 4日涨幅
+            raw_4c = get_history(4, '1d', 'close', s, fq='pre', include=False, is_dict=True)
+            cl4 = _extract_val(raw_4c, s)
+            if not cl4 or len(cl4) < 4:
+                continue
+            inc = (cl4[-1] - cl4[0]) / cl4[0]
+            if inc > 0.28:
+                continue
 
-        prev1 = get_history(1, '1d', ['open', 'close'], security_list=s,
-                           fq=None, include=False)
-        if prev1 is None or len(prev1) < 1:
-            continue
-        oc_ratio = (prev1['close'].iloc[-1] - prev1['open'].iloc[-1]) / prev1['open'].iloc[-1]
-        if oc_ratio < -0.05:
-            continue
+            # 昨日开收盘
+            raw_o1 = get_history(1, '1d', 'open', s, fq='pre', include=False, is_dict=True)
+            raw_c1 = get_history(1, '1d', 'close', s, fq='pre', include=False, is_dict=True)
+            ol1 = _extract_val(raw_o1, s)
+            cl1 = _extract_val(raw_c1, s)
+            if not ol1 or not cl1:
+                continue
+            oc_ratio = (cl1[-1] - ol1[-1]) / ol1[-1]
+            if oc_ratio < -0.05:
+                continue
 
-        prev_mvm = get_history(1, '1d', ['close', 'volume', 'money'],
-                               security_list=s, fq=None, include=False)
-        if prev_mvm is None or prev_mvm['money'].iloc[-1] < 3e8 or prev_mvm['money'].iloc[-1] > 19e8:
-            continue
-        avg_px_inc2 = prev_mvm['money'].iloc[-1] / prev_mvm['volume'].iloc[-1] / prev_mvm['close'].iloc[-1] - 1
-        if avg_px_inc2 < -0.04:
+            # 昨日成交额/量
+            raw_v1 = get_history(1, '1d', 'volume', s, fq='pre', include=False, is_dict=True)
+            raw_m1 = get_history(1, '1d', 'money', s, fq='pre', include=False, is_dict=True)
+            vl1 = _extract_val(raw_v1, s)
+            ml1 = _extract_val(raw_m1, s)
+            if not vl1 or not ml1:
+                continue
+            prev_money2 = ml1[-1]
+            prev_vol2 = vl1[-1]
+            prev_close2 = cl1[-1]
+            if prev_money2 < 3e8 or prev_money2 > 19e8:
+                continue
+            avg_px_inc2 = prev_money2 / prev_vol2 / prev_close2 - 1
+            if avg_px_inc2 < -0.04:
+                continue
+        except Exception:
             continue
 
         try:
             val2 = get_fundamentals(s, 'valuation',
                                   fields=['market_cap', 'circulating_market_cap'],
-                                  date=prev_day.strftime('%Y%m%d'))
+                                  date=date_str.replace('-', ''))
             if val2 is None or val2.empty:
                 continue
             if val2['market_cap'].iloc[0] < 70 or val2['circulating_market_cap'].iloc[0] > 520:
@@ -500,17 +620,17 @@ def buy(context, data):
             continue
 
         zyts2 = _calculate_zyts(s, context)
-        vol2 = get_history(zyts2, '1d', 'volume', security_list=s,
-                           fq=None, include=False)
-        if vol2 is None or len(vol2) < 2:
+        raw_vz2 = get_history(zyts2, '1d', 'volume', s, fq='pre', include=False, is_dict=True)
+        vols2 = _extract_val(raw_vz2, s)
+        if vols2 is None or len(vols2) < 2:
             continue
-        if vol2['volume'].iloc[-1] <= vol2['volume'].iloc[:-1].max() * 0.9:
+        if vols2[-1] <= max(vols2[:-1]) * 0.9:
             continue
 
-        auction_vol2, auction_px2, hl_px2 = _get_auction_data(s, context, prev_mvm)
+        auction_vol2, auction_px2, hl_px2 = _get_auction_data(s, context, prev_vol2)
         if auction_vol2 is None:
             continue
-        if auction_vol2 / prev_mvm['volume'].iloc[-1] < 0.03:
+        if auction_vol2 / prev_vol2 < 0.03:
             continue
         cr2 = auction_px2 / (hl_px2 / 1.1)
         if cr2 <= 0.98 or cr2 >= 1.09:
@@ -590,7 +710,7 @@ def buy(context, data):
 
 # ──────────────────── 卖出（11:25 / 14:50） ────────────────────
 
-def sell(context, data):
+def sell(context):
     hold = list(context.portfolio.positions.keys())
     if not hold:
         return
@@ -600,7 +720,7 @@ def sell(context, data):
     today_str = context.blotter.current_dt.strftime('%Y%m%d')
 
     price_df = get_price(hold, end_date=today_date_str, count=1,
-                         fields=['close', 'high_limit'], panel=False)
+                         fields=['close', 'high_limit'])
     if price_df.empty:
         return
     price_df = price_df.set_index('code')
@@ -625,7 +745,7 @@ def sell(context, data):
                 log.info('[卖出] T+1限制 %s' % s)
                 continue
             now = float(price_df.loc[s, 'close']) if s in price_df.index else \
-                float(getattr(pos, 'avg_cost', 0) or 0)
+                float(getattr(pos, 'cost_basis', 0) or 0)
             high_lmt = float(price_df.loc[s, 'high_limit']) if s in price_df.index else now * 1.1
 
             pending = g.pending_order
@@ -633,17 +753,10 @@ def sell(context, data):
                 log.info('[卖出] 已有未完成卖单 %s' % s)
                 continue
 
-            cost = float(getattr(pos, 'avg_cost', 0) or 0)
+            cost = float(getattr(pos, 'cost_basis', 0) or 0)
             if now < high_lmt and now > cost:
                 name = g.code_name.get(s, s)
-                if is_trade():
-                    sp = _get_live_price(s, direction='sell')
-                    if sp:
-                        oid = order(s, -sell_amount, limit_price=sp)
-                    else:
-                        oid = None
-                else:
-                    oid = order(s, -sell_amount)
+                oid = _do_sell(s, sell_amount, now)
                 if oid is not None:
                     g.pending_order = {'code': s, 'side': 'sell', 'order_id': oid}
                 log.info('[止盈卖出] %s' % name)
@@ -664,40 +777,26 @@ def sell(context, data):
                 continue
 
             now = float(price_df.loc[s, 'close']) if s in price_df.index else \
-                float(getattr(pos, 'avg_cost', 0) or 0)
+                float(getattr(pos, 'cost_basis', 0) or 0)
             high_lmt = float(price_df.loc[s, 'high_limit']) if s in price_df.index else now * 1.1
-            cost = float(getattr(pos, 'avg_cost', 0) or 0)
+            cost = float(getattr(pos, 'cost_basis', 0) or 0)
 
-            close_h = get_history(4, '1d', 'close', security_list=s,
-                                 fq=None, include=False)
-            if close_h is not None and len(close_h) >= 4:
-                ma4 = close_h['close'].mean()
+            raw_ch = get_history(4, '1d', 'close', s, fq='pre', include=False, is_dict=True)
+            ch_vals = _extract_val(raw_ch, s)
+            if ch_vals and len(ch_vals) >= 4:
+                ma4 = sum(ch_vals) / len(ch_vals)
                 ma5 = (ma4 * 4 + now) / 5
             else:
                 ma5 = cost
 
             name = g.code_name.get(s, s)
             if now < high_lmt and now > cost:
-                if is_trade():
-                    sp = _get_live_price(s, direction='sell')
-                    if sp:
-                        oid = order(s, -sell_amount, limit_price=sp)
-                    else:
-                        oid = None
-                else:
-                    oid = order(s, -sell_amount)
+                oid = _do_sell(s, sell_amount, now)
                 if oid is not None:
                     g.pending_order = {'code': s, 'side': 'sell', 'order_id': oid}
                 log.info('[止盈卖出] %s' % name)
             elif now < ma5:
-                if is_trade():
-                    sp = _get_live_price(s, direction='sell')
-                    if sp:
-                        oid = order(s, -sell_amount, limit_price=sp)
-                    else:
-                        oid = None
-                else:
-                    oid = order(s, -sell_amount)
+                oid = _do_sell(s, sell_amount, now)
                 if oid is not None:
                     g.pending_order = {'code': s, 'side': 'sell', 'order_id': oid}
                 log.info('[止损卖出（跌破5日线）] %s' % name)
