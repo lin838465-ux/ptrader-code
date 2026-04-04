@@ -210,9 +210,25 @@ def buy(context):
         print('———————————————————————————————————')
     else:
         send_message('今日无目标个股')
-        print('今日无目标个股')  
-    
-        
+        print('今日无目标个股')
+
+    # ═══ 只买最优的N只（按子策略优先级：首板低开 > 一进二 > 弱转强）═══
+    MAX_BUY = 1  # ← 改这里：1=只买1只，2=买2只
+    if len(qualified_stocks) > MAX_BUY:
+        # 按优先级排序
+        priority = {}
+        for s in dk_stocks:
+            priority[s] = 1   # 首板低开最稳
+        for s in gk_stocks:
+            if s not in priority:
+                priority[s] = 2   # 一进二其次
+        for s in rzq_stocks:
+            if s not in priority:
+                priority[s] = 3   # 弱转强最后
+        qualified_stocks.sort(key=lambda s: priority.get(s, 9))
+        qualified_stocks = qualified_stocks[:MAX_BUY]
+        print('精选%d只：%s' % (MAX_BUY, ','.join(qualified_stocks)))
+
     if len(qualified_stocks)!=0  and context.portfolio.available_cash/context.portfolio.total_value>0.3:
         value = context.portfolio.available_cash / len(qualified_stocks)
         for s in qualified_stocks:
