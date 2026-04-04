@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "stock-sdk": {
+      "command": "npx",
+      "args": ["-y", "stock-sdk-mcp"],
+      "description": "股票行情数据服务 - 支持A股/港股/美股实时行情、K线数据、技术指标、板块数据、选股分析"
+    }
+  }
+}
