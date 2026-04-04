@@ -82,9 +82,38 @@ ETF23_EXTRA = [
     {"code": "159880.SZ", "name": "有色ETF"},
 ]
 
-ETF_ALL = ETF12 + ETF23_EXTRA   # 24只，全部池子
+ETF_T0_EXTRA = [
+    # T零策略新增（不在 ETF12/ETF23 中的）
+    {"code": "513330.SS", "name": "恒生互联网ETF"},
+    {"code": "513050.SS", "name": "中概互联ETF"},
+    {"code": "159518.SZ", "name": "日经ETF"},
+    {"code": "513310.SS", "name": "港股科技30ETF"},
+    {"code": "513900.SS", "name": "港股红利ETF"},
+    {"code": "513030.SS", "name": "港股通ETF"},
+    {"code": "513000.SS", "name": "日经225ETF"},
+    {"code": "513080.SS", "name": "法国CAC40ETF"},
+    {"code": "159502.SZ", "name": "中韩半导体ETF"},
+    {"code": "159980.SZ", "name": "有色金属ETF"},
+    {"code": "520500.SS", "name": "恒生创新药ETF"},
+    {"code": "159608.SZ", "name": "稀有金属ETF"},
+    {"code": "159985.SZ", "name": "豆粕ETF"},
+    {"code": "159981.SZ", "name": "能源化工ETF"},
+    {"code": "159286.SZ", "name": "碳中和ETF"},
+]
 
-POOLS = {"etf12": ETF12, "etf23": ETF12 + ETF23_EXTRA, "all": ETF_ALL}
+ETF_ALL = ETF12 + ETF23_EXTRA + ETF_T0_EXTRA   # 39只，三策略全覆盖
+
+POOLS = {
+    "etf12": ETF12,
+    "etf23": ETF12 + ETF23_EXTRA,
+    "t0":    ETF12[:0] + ETF_T0_EXTRA + [  # T零主池
+        {"code": "513180.SS", "name": "恒生科技ETF"},
+        {"code": "162411.SZ", "name": "华宝油气"},
+        {"code": "513100.SS", "name": "纳指ETF"},
+        {"code": "518880.SS", "name": "黄金ETF"},
+    ],
+    "all":   ETF_ALL,
+}
 
 # TDX 频率: klt → category
 KLT_TO_TDX = {1: 7, 5: 0, 15: 1, 30: 2, 60: 3}
@@ -379,8 +408,8 @@ def main():
     parser.add_argument("--source", default="tdx", choices=["tdx", "em"],
                         help="数据源: tdx=通达信(默认,1.5年), em=东方财富(5年,需VPN)")
     parser.add_argument("--klt",    type=int, default=5, choices=[1, 5, 15, 30, 60])
-    parser.add_argument("--pool",   default="all", choices=["etf12", "etf23", "all"],
-                        help="ETF池: etf12/etf23/all(默认)")
+    parser.add_argument("--pool",   default="all", choices=["etf12", "etf23", "t0", "all"],
+                        help="ETF池: etf12/etf23/t0/all(默认)")
     parser.add_argument("--etf",    default=None, help="只处理单只ETF，如 518880.SS")
     parser.add_argument("--full",   action="store_true", help="强制全量（覆盖增量）")
     parser.add_argument("--proxy",  default=DEFAULT_PROXY,
