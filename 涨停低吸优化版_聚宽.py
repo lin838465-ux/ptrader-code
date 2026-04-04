@@ -246,7 +246,7 @@ def _get_candidates(context):
 
     # 2. 批量取近8日K线
     df = get_price(stock_pool, end_date=yesterday, count=8,
-                   fields=['open', 'close', 'high_limit'],
+                   fields=['open', 'close', 'high', 'low', 'high_limit'],
                    panel=False, fill_paused=False, skip_paused=True)
     if df is None or df.empty:
         return []
@@ -301,12 +301,24 @@ def _get_candidates(context):
         if open_gap < g.min_open_gap or open_gap > g.max_open_gap:
             continue
 
-        # ── 条件4：不是停牌/ST ──
+        # ── 条件4：不是停牌/ST（双重检查，防*ST漏网）──
         try:
             if curr_data[stock].paused or curr_data[stock].is_st:
                 continue
+            # 名称里含ST也过滤（防*ST漏网）
+            stock_name = get_security_info(stock).display_name
+            if 'ST' in stock_name or 'st' in stock_name:
+                continue
         except Exception:
             pass
+
+        # ── 条件5：昨日振幅不能太大（振幅>8%的票波动太剧烈，容易跳空）──
+        y_high = float(sub['high'].iloc[-1]) if 'high' in sub.columns else y_close
+        y_low = float(sub['low'].iloc[-1]) if 'low' in sub.columns else y_close
+        if y_low > 0:
+            y_amplitude = (y_high - y_low) / y_low
+            if y_amplitude > 0.08:
+                continue
 
         # ── 打分（越低越好）──
         gap_penalty = abs(open_gap - g.target_open_gap) * 100
