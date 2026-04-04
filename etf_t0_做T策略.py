@@ -47,6 +47,46 @@ def _etf_name(code):
 # 工具函数
 # ─────────────────────────────────────────────────────────────
 
+def _extract_data_list(raw_dict, code):
+    """从get_history(is_dict=True)返回值中提取数据列表
+    兼容PTrade不同版本的返回格式和代码后缀(.SS/.XSHG等)
+    """
+    arr = None
+    if code in raw_dict:
+        arr = raw_dict[code]
+    else:
+        # PTrade内部可能用不同后缀
+        for old, new in [('.SS', '.XSHG'), ('.SZ', '.XSHE'),
+                         ('.XSHG', '.SS'), ('.XSHE', '.SZ')]:
+            alt = code.replace(old, new)
+            if alt in raw_dict:
+                arr = raw_dict[alt]
+                break
+        if arr is None:
+            code6 = code[:6]
+            for k in raw_dict:
+                if k[:6] == code6:
+                    arr = raw_dict[k]
+                    break
+
+    if arr is None or len(arr) == 0:
+        return None
+
+    res = []
+    for row in arr:
+        try:
+            if isinstance(row, (int, float)):
+                res.append(float(row))
+            elif hasattr(row, '__len__'):
+                if len(row) >= 5:
+                    res.append(float(row[4]))  # OHLCV格式取close
+                elif len(row) > 0:
+                    res.append(float(row[-1]))
+        except Exception:
+            pass
+    return res if res else None
+
+
 def _get_file_path(filename):
     try:
         return get_research_path() + '/' + filename
@@ -102,21 +142,49 @@ def _get_snap(code):
     else:
         # 回测模式：用get_history模拟基本字段
         try:
-            raw = get_history(2, '1d', 'close', code, fq='pre', include=True)
+            # 获取收盘价（is_dict=True确保返回dict格式）
+            raw = get_history(2, '1d', 'close', code, fq='pre', include=True, is_dict=True)
             if raw is None or len(raw) == 0:
                 return None
-            closes = list(raw[code]) if code in raw else []
+            closes = _extract_data_list(raw, code)
             if not closes:
                 return None
             px = float(closes[-1])
             preclose = float(closes[-2]) if len(closes) > 1 else px
+
+            # 尝试获取开盘/最高/最低价（更准确的回测模拟）
+            open_px = px
+            high_px = px
+            low_px = px
+            try:
+                raw_o = get_history(1, '1d', 'open', code, fq='pre', include=True, is_dict=True)
+                if raw_o:
+                    ol = _extract_data_list(raw_o, code)
+                    if ol:
+                        open_px = float(ol[-1])
+                raw_h = get_history(1, '1d', 'high', code, fq='pre', include=True, is_dict=True)
+                if raw_h:
+                    hl = _extract_data_list(raw_h, code)
+                    if hl:
+                        high_px = float(hl[-1])
+                raw_l = get_history(1, '1d', 'low', code, fq='pre', include=True, is_dict=True)
+                if raw_l:
+                    ll = _extract_data_list(raw_l, code)
+                    if ll:
+                        low_px = float(ll[-1])
+            except Exception:
+                pass
+
+            # VWAP近似：回测无法获取真实分时VWAP，用(open+high+low+close)/4近似
+            wavg_px = (open_px + high_px + low_px + px) / 4.0
+
             return {
                 'last_px': px,
-                'open_px': px,  # 回测近似
-                'high_px': px,
-                'low_px': px,
+                'open_px': open_px,
+                'high_px': high_px,
+                'low_px': low_px,
                 'preclose_px': preclose,
-                'wavg_px': px,   # 回测无法获取真实VWAP，用收盘价近似
+                'wavg_px': wavg_px,
                 'business_amount': 0,
                 'business_balance': 0,
                 'vol_ratio': 1.0,
@@ -399,11 +467,11 @@ def _reset_daily_state(context):
 def _is_downtrend(code):
     """近N日累计跌幅超过阈值 = 下跌趋势"""
     try:
-        hist = get_history(g.trend_ma_days + 1, '1d', 'close', code, fq='pre', include=False)
-        if hist is None or len(hist) < g.trend_ma_days:
+        hist = get_history(g.trend_ma_days + 1, '1d', 'close', code, fq='pre', include=False, is_dict=True)
+        if hist is None or len(hist) == 0:
             return False
-        closes = list(hist[code])
-        if len(closes) < 2:
+        closes = _extract_data_list(hist, code)
+        if not closes or len(closes) < 2:
             return False
         change = (closes[-1] - closes[0]) / closes[0]
         return change < -g.trend_drop_threshold
@@ -415,10 +483,12 @@ def _is_downtrend(code):
 def _get_avg_daily_amount(code, days):
     """获取近N日的日均成交额（元）"""
     try:
-        hist = get_history(days, '1d', 'money', code, fq='pre', include=False)
+        hist = get_history(days, '1d', 'money', code, fq='pre', include=False, is_dict=True)
         if hist is None or len(hist) == 0:
             return 0
-        amounts = list(hist[code])
+        amounts = _extract_data_list(hist, code)
+        if not amounts:
+            return 0
         valid = [a for a in amounts if a and a > 0]
         return sum(valid) / len(valid) if valid else 0
     except Exception as e:
