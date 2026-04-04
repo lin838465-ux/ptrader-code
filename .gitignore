@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+validator_output/
+.claude/scheduled_tasks.lock
